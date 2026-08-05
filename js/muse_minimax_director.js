@@ -195,18 +195,18 @@ function injectStyles() {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: 10px;
   }
   .mmd-char-slot {
-    background: #1e1e26; border: 1.5px dashed #33333f; border-radius: 10px;
+    background: #1e1e26; border: 1.5px dashed rgba(255,255,255,0.22); border-radius: 10px;
     display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
     padding: 5px; cursor: pointer; position: relative; transition: all 0.15s ease; box-sizing: border-box;
   }
   .mmd-char-slot:hover { border-color: #4F8EF7; background: #1a1c24; }
-  .mmd-char-slot.mmd-filled { border-style: solid; border-color: #2e2e3a; }
-  .mmd-char-slot.mmd-bg-slot { border-color: #F7B94F55; }
+  .mmd-char-slot.mmd-filled { border-style: solid; border-color: rgba(255,255,255,0.35); }
+  .mmd-char-slot.mmd-bg-slot { border-color: #F7B94F99; }
   .mmd-char-slot.mmd-bg-slot:hover { border-color: #F7B94F; }
   .mmd-char-slot.mmd-char-slot-disabled {
     opacity: 0.35; cursor: not-allowed; pointer-events: none;
   }
-  .mmd-char-slot.mmd-char-slot-disabled:hover { border-color: #33333f; background: #1e1e26; }
+  .mmd-char-slot.mmd-char-slot-disabled:hover { border-color: rgba(255,255,255,0.22); background: #1e1e26; }
   .mmd-char-label {
     position: absolute; top: 4px; left: 5px; font-size: 8.5px; font-weight: 700;
     color: #fff; background: rgba(0,0,0,0.55); border-radius: 4px; padding: 1px 4px;
@@ -240,10 +240,10 @@ function injectStyles() {
   /* Reference video / audio slots */
   .mmd-av-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
   .mmd-av-slot {
-    flex: 1; min-width: 220px; background: #1e1e26; border: 1.5px dashed #33333f; border-radius: 10px;
+    flex: 1; min-width: 220px; background: #1e1e26; border: 1.5px dashed rgba(255,255,255,0.22); border-radius: 10px;
     padding: 8px 10px; box-sizing: border-box; position: relative;
   }
-  .mmd-av-slot.mmd-filled { border-style: solid; border-color: #2e2e3a; }
+  .mmd-av-slot.mmd-filled { border-style: solid; border-color: rgba(255,255,255,0.35); }
   .mmd-av-slot-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
   .mmd-av-slot-label { font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em; color: #7a7a8c; text-transform: uppercase; }
   .mmd-av-slot-del {
