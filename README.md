@@ -143,6 +143,7 @@ None of these are needed for `MuseMinimaxDirector` itself to work — only for t
 | `aspect_ratio` | Combo | Output aspect ratio |
 | `megapixels` | FLOAT | Output resolution budget |
 | `multiple` | INT | Resolution rounding constraint |
+| `resize_method` | Combo | How every character/background reference image and First/Last Frame image gets fit to the output resolution when its own aspect ratio doesn't match. `crop` scales up and center-crops the excess (no distortion, may crop the edges). `pad` scales down to fit and adds black bars (nothing cropped, but the bars become visible reference content). `stretch` resizes directly, distorting proportions — this is what H3 does internally on its own if you don't fit the image yourself, so it's here for parity, not as the recommended choice |
 | `duration_seconds` | FLOAT | Total output length. If this is longer than one H3 generation can produce in a single call, the node automatically splits the render into multiple chunks |
 | `chunk_duration_seconds` | FLOAT | Target length per chunk when chunking is needed |
 | `ref_image_size` | Combo | Resolution reference images are resized to before being sent to H3 |

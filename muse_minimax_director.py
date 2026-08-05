@@ -276,6 +276,46 @@ def _resolve_resolution(aspect_ratio: str, megapixels: float, multiple: int):
     return width, height
 
 
+def _fit_image_to_target(tensor: torch.Tensor, target_w: int, target_h: int, method: str) -> torch.Tensor:
+    """Resizes an [N,H,W,C] IMAGE tensor to exactly (target_h, target_w) ourselves,
+    using one of three standard fit strategies, rather than leaving an aspect-ratio
+    mismatch to whatever H3's own internal preprocessing happens to do (observed
+    directly: it silently stretches/distorts rather than cropping).
+      - crop: scale up to fully cover the target, then center-crop the excess — no
+        distortion, no bars, but can crop off the edges of a person/scene on a big
+        aspect-ratio swing
+      - pad: scale down to fully fit within the target, then pad with black bars —
+        never crops anything, but the bars themselves become visible reference content
+      - stretch: resize straight to the target dimensions, ignoring aspect ratio —
+        matches H3's own old implicit behavior, now done deterministically by us
+    Used for character/background reference images and First/Last Frame's locked
+    frame images — not reference videos, which H3 handles with its own separate
+    ref_image_size resolution logic."""
+    if tensor is None:
+        return None
+    n, h, w, c = tensor.shape
+    if h == target_h and w == target_w:
+        return tensor
+    chw = tensor.permute(0, 3, 1, 2)
+    if method == "stretch":
+        resized = torch.nn.functional.interpolate(chw, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        return resized.permute(0, 2, 3, 1).clamp(0, 1)
+    scale = max(target_w / w, target_h / h) if method == "crop" else min(target_w / w, target_h / h)
+    new_w = max(1, round(w * scale))
+    new_h = max(1, round(h * scale))
+    resized = torch.nn.functional.interpolate(chw, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    resized = resized.permute(0, 2, 3, 1).clamp(0, 1)
+    if method == "crop":
+        top = max(0, (new_h - target_h) // 2)
+        left = max(0, (new_w - target_w) // 2)
+        return resized[:, top:top + target_h, left:left + target_w, :]
+    canvas = torch.zeros((n, target_h, target_w, c), dtype=resized.dtype)
+    top = max(0, (target_h - new_h) // 2)
+    left = max(0, (target_w - new_w) // 2)
+    canvas[:, top:top + new_h, left:left + new_w, :] = resized
+    return canvas
+
+
 def _load_image_source(b64_or_url: str, filename: str = "") -> torch.Tensor:
     if not b64_or_url:
         return None
@@ -423,7 +463,7 @@ def _load_ref_audio_clip(entry: dict, target_sr: int = 44100):
         return None
 
 
-def _build_character_subjects(tdata: dict):
+def _build_character_subjects(tdata: dict, target_w: int, target_h: int, resize_method: str):
     """Character reference images become both H3's ref_images (dense fill-order
     Picture tags, same rule as before — MiniMaxH3ReferenceToVideo assigns <Picture N>
     purely by iteration order over ref_images.values(), confirmed from its own
@@ -443,7 +483,9 @@ def _build_character_subjects(tdata: dict):
     "(present throughout)" vs "(appears in [Shot N], ...)" presence clause once it
     knows which shots each subject's tag actually appears in for that chunk (a
     character introduced only from Shot 2 onward must not be asserted as present
-    throughout the whole chunk)."""
+    throughout the whole chunk). target_w/target_h/resize_method fit every loaded
+    image to the output resolution ourselves via _fit_image_to_target, rather than
+    leaving aspect-mismatched references to whatever H3 does with them internally."""
     characters = tdata.get("characters", [])[:MAX_CHARACTER_SLOTS]
 
     ref_images = {}
@@ -457,6 +499,7 @@ def _build_character_subjects(tdata: dict):
         tensor = _load_character_image(ch)
         if tensor is None:
             continue
+        tensor = _fit_image_to_target(tensor, target_w, target_h, resize_method)
         slot = len(ref_images)
         ref_images[f"ref_image_{slot}"] = tensor
         picture_n = slot + 1
@@ -712,6 +755,13 @@ class MuseMinimaxDirector:
                 "aspect_ratio": (ASPECT_RATIO_OPTIONS, {"default": AspectRatio.WIDESCREEN_H.value}),
                 "megapixels": ("FLOAT", {"default": 0.98, "min": 0.1, "max": 4.0, "step": 0.02}),
                 "multiple": ("INT", {"default": 32, "min": 8, "max": 128, "step": 4, "advanced": True}),
+                "resize_method": (["crop", "pad", "stretch"], {"default": "crop", "tooltip":
+                    "How every character/background reference image and First/Last Frame image gets fit to "
+                    "the output resolution when its own aspect ratio doesn't match. 'crop' scales up and "
+                    "center-crops the excess (no distortion, may crop the edges of a person/scene). 'pad' "
+                    "scales down to fit entirely within the frame and adds black bars (nothing cropped, but "
+                    "the bars become visible reference content). 'stretch' resizes directly, distorting "
+                    "proportions."}),
                 "duration_seconds": ("FLOAT", {"default": 10.0, "min": 1.0, "max": 120.0, "step": 0.5,
                     "tooltip": "Total length of the finished video. Automatically split into multiple H3 "
                                "generation calls if longer than chunk_duration_seconds, stitched together."}),
@@ -768,12 +818,17 @@ class MuseMinimaxDirector:
     FUNCTION = "execute"
     CATEGORY = "Muse Collective"
 
-    def execute(self, mode, model, clip, vae, audio_vae, aspect_ratio, megapixels, multiple,
+    def execute(self, mode, model, clip, vae, audio_vae, aspect_ratio, megapixels, multiple, resize_method,
                 duration_seconds, chunk_duration_seconds, ref_image_size, hybrid_continuation,
                 seed, steps, sampler_name, scheduler, shift_video, shift_audio, timeline_data,
                 model_fl2va=None):
         tdata = _parse_timeline(timeline_data)
-        char_ref_images, subject_lines, subject_retention_meta, subject_number_by_char_index = _build_character_subjects(tdata)
+        # Resolved before any reference image is loaded — every character/background/
+        # First-Last-Frame image gets fit to this exact resolution via resize_method,
+        # rather than leaving an aspect-ratio mismatch to whatever H3 does internally.
+        width, height = _resolve_resolution(aspect_ratio, megapixels, multiple)
+        char_ref_images, subject_lines, subject_retention_meta, subject_number_by_char_index = _build_character_subjects(
+            tdata, width, height, resize_method)
         subject_count = len(subject_lines)
         dialogue_language = (tdata.get("dialogue_language") or "English").strip() or "English"
         background = tdata.get("background")
@@ -787,7 +842,9 @@ class MuseMinimaxDirector:
         # concern here — Ref 1 must always mean Ref 1.
         characters_raw = tdata.get("characters", [])
         first_frame = _load_character_image(characters_raw[0]) if len(characters_raw) > 0 and characters_raw[0] else None
+        first_frame = _fit_image_to_target(first_frame, width, height, resize_method)
         last_frame = _load_character_image(characters_raw[1]) if len(characters_raw) > 1 and characters_raw[1] else None
+        last_frame = _fit_image_to_target(last_frame, width, height, resize_method)
         # Background/continuity-anchor slot: the next free dense position after however
         # many character images actually made it into char_ref_images — NOT a fixed index
         # — same reasoning as _build_character_subjects: H3 tags by iteration order, so
@@ -795,7 +852,6 @@ class MuseMinimaxDirector:
         # slot number that only happens to be correct when all 9 character slots are full.
         bg_index = len(char_ref_images)
         style_line = (tdata.get("style_line") or "").strip()
-        width, height = _resolve_resolution(aspect_ratio, megapixels, multiple)
 
         buckets, chunk_lengths, chunk_bounds = _bucket_segments_into_chunks(tdata, duration_seconds, chunk_duration_seconds)
         num_chunks = len(buckets)
@@ -1092,6 +1148,7 @@ class MuseMinimaxDirector:
                 elif background and (background.get("file") or background.get("image_b64")):
                     tensor = _load_character_image(background)
                     if tensor is not None:
+                        tensor = _fit_image_to_target(tensor, width, height, resize_method)
                         chunk_ref_images[f"ref_image_{bg_index}"] = tensor
                         bg_picture_n = bg_index + 1
                         bg_subj_n = len(chunk_subject_tags) + 1

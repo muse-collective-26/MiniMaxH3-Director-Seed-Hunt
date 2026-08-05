@@ -25,7 +25,7 @@ const REF_AV_SLOTS = 3;
 const HIDDEN_WIDGET_NAMES = ["timeline_data"];
 const BOXED_WIDGET_NAMES = [
   "mode", "duration_seconds", "chunk_duration_seconds",
-  "aspect_ratio", "megapixels", "multiple",
+  "aspect_ratio", "megapixels", "multiple", "resize_method",
   "steps", "sampler_name", "scheduler", "seed", "control_after_generate", "shift_video", "shift_audio",
   "ref_image_size", "hybrid_continuation",
 ];
@@ -614,6 +614,7 @@ class MinimaxTimelineEditor {
     if (this.realWidgets.aspect_ratio) box.appendChild(this._selectRow("Aspect Ratio", this.realWidgets.aspect_ratio));
     if (this.realWidgets.megapixels) box.appendChild(this._numberRow("Megapixels", this.realWidgets.megapixels));
     if (this.realWidgets.multiple) box.appendChild(this._numberRow("Multiple Of", this.realWidgets.multiple));
+    if (this.realWidgets.resize_method) box.appendChild(this._selectRow("Resize Method", this.realWidgets.resize_method));
     return box;
   }
 
