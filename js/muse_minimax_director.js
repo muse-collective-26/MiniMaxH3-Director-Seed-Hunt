@@ -1161,7 +1161,12 @@ class MinimaxTimelineEditor {
     const wrap = document.createElement("div");
     wrap.className = "mmd-av-media";
 
-    const src = entry._blobUrl || comfyViewUrl(entry.file);
+    // _blobUrl only lives for the page session that created it via
+    // URL.createObjectURL — it goes dead after any reload, but the string itself
+    // gets saved into timeline_data and reloaded right along with it. entry.file
+    // (the real uploaded server path) is always durable, so it must win once it
+    // exists; _blobUrl is only a same-session fast path for brand new uploads.
+    const src = entry.file ? comfyViewUrl(entry.file) : entry._blobUrl;
     let mediaEl;
     if (kind === "video") {
       mediaEl = document.createElement("video");
@@ -1401,7 +1406,10 @@ class MinimaxTimelineEditor {
       const preview = document.createElement("div");
       preview.className = "mmd-char-preview";
       const img = document.createElement("img");
-      img.src = data._blobUrl || (data.file ? comfyViewUrl(data.file) : data.image_b64);
+      // See the same comment on the ref video/audio media src above — a dead
+      // _blobUrl from a previous page session must never win over the durable
+      // uploaded file path once one exists.
+      img.src = data.file ? comfyViewUrl(data.file) : (data._blobUrl || data.image_b64);
       preview.appendChild(img);
       slot.appendChild(preview);
 
@@ -1482,7 +1490,7 @@ class MinimaxTimelineEditor {
 
   async _resolveImageB64(data) {
     if (data.image_b64) return data.image_b64;
-    const src = data._blobUrl || (data.file ? comfyViewUrl(data.file) : null);
+    const src = data.file ? comfyViewUrl(data.file) : data._blobUrl;
     if (!src) throw new Error("No image source available for this reference.");
     return await urlToB64(src);
   }
