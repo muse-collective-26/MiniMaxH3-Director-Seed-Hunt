@@ -119,8 +119,9 @@ function injectStyles() {
   .mmd-box-row label { font-size: 10.5px; color: #9a9aa8; white-space: nowrap; }
   .mmd-box-select, .mmd-box-number {
     background: #101015; border: 1px solid #2e2e3a; border-radius: 6px; color: #e4e4ea;
-    font-size: 10.5px; padding: 4px 6px; max-width: 62%; box-sizing: border-box;
+    font-size: 11px; padding: 4px 6px; max-width: 62%; box-sizing: border-box;
   }
+  .mmd-box-select option { background: #1a1a22; color: #e4e4ea; font-size: 11px; }
   .mmd-box-checkbox { width: 15px; height: 15px; accent-color: #4F8EF7; cursor: pointer; }
   .mmd-box-select:focus, .mmd-box-number:focus { outline: none; border-color: #4F8EF7; }
   .mmd-mode-pill {
@@ -280,23 +281,25 @@ function injectStyles() {
     font-size: 9px; color: #9a9aa8;
   }
 
-  /* Small secondary selectors (retention markers, video role) — deliberately
-     understated so they don't compete visually with the description field above
-     them. Sensible defaults mean most users never need to touch these. */
+  /* Small secondary selectors (retention markers, video role, CUT speaker) — kept
+     visually secondary via color/weight, NOT via tiny type — legibility comes
+     first. Options list styled explicitly too, since browsers otherwise render
+     a plain white system popup regardless of the select's own dark styling. */
   .mmd-mini-row {
-    display: flex; align-items: center; justify-content: space-between; gap: 6px;
-    margin-top: 5px;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    margin-top: 6px;
   }
-  .mmd-mini-row label { font-size: 8.5px; color: #5a5a6a; }
+  .mmd-mini-row label { font-size: 11px; color: #8a8a98; }
   .mmd-mini-select {
-    background: #101015; border: 1px solid #2e2e3a; border-radius: 4px; color: #9a9aa8;
-    font-size: 8px; padding: 2px 3px; max-width: 60%; box-sizing: border-box;
+    background: #101015; border: 1px solid #2e2e3a; border-radius: 5px; color: #d4d4dc;
+    font-size: 11.5px; padding: 4px 7px; max-width: 62%; box-sizing: border-box;
   }
+  .mmd-mini-select option { background: #1a1a22; color: #e4e4ea; font-size: 11.5px; }
 
   .mmd-cut-speaker-row {
-    display: flex; align-items: center; gap: 6px; padding: 0 7px 7px 7px;
+    display: flex; align-items: center; gap: 8px; padding: 0 7px 8px 7px;
   }
-  .mmd-cut-speaker-row label { font-size: 8.5px; color: #6a6a7a; white-space: nowrap; }
+  .mmd-cut-speaker-row label { font-size: 11px; color: #8a8a98; white-space: nowrap; }
 
   .mmd-lang-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 0; border-top: 1px solid #22222b; }
   .mmd-lang-row label { font-size: 10.5px; color: #9a9aa8; white-space: nowrap; }
