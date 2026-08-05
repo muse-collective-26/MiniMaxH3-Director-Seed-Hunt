@@ -521,7 +521,11 @@ def _normalize_dialogue_text(text: str) -> str:
     text = text.strip()
     text = _DECORATIVE_RE.sub('', text)
     text = _REPEATED_PUNCT_RE.sub(r'\1', text)
-    text = text.strip()
+    # A quote captured mid-sentence often ends in a comma by normal grammar
+    # (he says, "this must be it," and continues...) — that comma isn't the
+    # dialogue's own terminal punctuation, so strip it before deciding whether
+    # to add one; otherwise it became "...it,." instead of "...it.".
+    text = text.rstrip(',').strip()
     if text and text[-1] not in '.!?':
         text += '.'
     return text
