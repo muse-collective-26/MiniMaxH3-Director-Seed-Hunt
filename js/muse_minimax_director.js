@@ -36,6 +36,28 @@ const BOXED_WIDGET_NAMES = [
 // versus what the native widget already has, just a cleaner text-based editor for it.
 const MODE_REFERENCE_PREFIX = "Reference (Omni)";
 
+// Fixed-vocabulary retention markers from MiniMax's own reference-mode prompt
+// guide (retention_analysis section) — visual markers apply to Subject/Picture/
+// Video, audio markers apply to Audio. Values are the literal English tokens the
+// guide requires; labels are just the friendlier on-screen text.
+const VISUAL_RETENTION_OPTIONS = [
+  { value: "fully_preserved", label: "fully preserved" },
+  { value: "partially_preserved", label: "partially preserved" },
+  { value: "attribute_transfer", label: "attribute transfer" },
+  { value: "weak_reference", label: "weak reference" },
+];
+const AUDIO_RETENTION_OPTIONS = [
+  { value: "reference", label: "reference (timbre/style only)" },
+  { value: "fully_copy", label: "fully copy" },
+  { value: "partially_copy", label: "partially copy" },
+  { value: "weak_reference", label: "weak reference" },
+];
+const VIDEO_ROLE_OPTIONS = [
+  { value: "reference", label: "Reference (motion/style/camera)" },
+  { value: "editing_source", label: "Editing source (replace something in it)" },
+  { value: "continuation_source", label: "Continuation source (extend from it)" },
+];
+
 const CUT_COLORS = [
   { bar: "#4F8EF7", glow: "rgba(79,142,247,0.35)" },
   { bar: "#33C481", glow: "rgba(51,196,129,0.35)" },
@@ -257,6 +279,31 @@ function injectStyles() {
     display: flex; align-items: center; gap: 6px; margin-top: 6px; cursor: pointer;
     font-size: 9px; color: #9a9aa8;
   }
+
+  /* Small secondary selectors (retention markers, video role) — deliberately
+     understated so they don't compete visually with the description field above
+     them. Sensible defaults mean most users never need to touch these. */
+  .mmd-mini-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    margin-top: 5px;
+  }
+  .mmd-mini-row label { font-size: 8.5px; color: #5a5a6a; }
+  .mmd-mini-select {
+    background: #101015; border: 1px solid #2e2e3a; border-radius: 4px; color: #9a9aa8;
+    font-size: 8px; padding: 2px 3px; max-width: 60%; box-sizing: border-box;
+  }
+
+  .mmd-cut-speaker-row {
+    display: flex; align-items: center; gap: 6px; padding: 0 7px 7px 7px;
+  }
+  .mmd-cut-speaker-row label { font-size: 8.5px; color: #6a6a7a; white-space: nowrap; }
+
+  .mmd-lang-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 0; border-top: 1px solid #22222b; }
+  .mmd-lang-row label { font-size: 10.5px; color: #9a9aa8; white-space: nowrap; }
+  .mmd-lang-input {
+    background: #101015; border: 1px solid #2e2e3a; border-radius: 6px; color: #e4e4ea;
+    font-size: 10.5px; padding: 4px 6px; max-width: 62%; box-sizing: border-box;
+  }
   `;
   document.head.appendChild(style);
 }
@@ -369,6 +416,13 @@ class MinimaxTimelineEditor {
     while (parsed.refVideos.length < REF_AV_SLOTS) parsed.refVideos.push(null);
     if (!Array.isArray(parsed.refAudios)) parsed.refAudios = [];
     while (parsed.refAudios.length < REF_AV_SLOTS) parsed.refAudios.push(null);
+    // Six-section MiniMax H3 prompt-format fields — see MiniMax's own reference-mode
+    // prompt-writing guide. overall_soundscape/non_diegetic_music are their own two
+    // required sections in that format (ambience/physical sound vs audience-only
+    // score); dialogue_language feeds every <d>[Language]...</d> dialogue tag.
+    if (typeof parsed.overall_soundscape !== "string") parsed.overall_soundscape = "";
+    if (typeof parsed.non_diegetic_music !== "string") parsed.non_diegetic_music = "";
+    if (typeof parsed.dialogue_language !== "string" || !parsed.dialogue_language) parsed.dialogue_language = "English";
     return parsed;
   }
 
@@ -409,6 +463,58 @@ class MinimaxTimelineEditor {
     });
     this.container.appendChild(styleInput);
 
+    this.soundTitle = document.createElement("div");
+    this.soundTitle.className = "mmd-section-title";
+    this.soundTitle.textContent = "Soundscape & Music";
+    this.container.appendChild(this.soundTitle);
+
+    this.soundHint = document.createElement("div");
+    this.soundHint.className = "mmd-track-hint";
+    this.soundHint.style.marginTop = "-4px";
+    this.soundHint.textContent = "Ambience/physical sound across the whole clip, and any background score only the audience can hear — Reference mode only, kept separate the way MiniMax's own prompt format expects.";
+    this.container.appendChild(this.soundHint);
+
+    this.soundRow = document.createElement("div");
+    this.soundRow.className = "mmd-boxes-row";
+
+    const soundscapeBox = document.createElement("div");
+    soundscapeBox.className = "mmd-box mmd-box-generation";
+    const soundscapeTitle = document.createElement("div");
+    soundscapeTitle.className = "mmd-box-title";
+    soundscapeTitle.textContent = "Overall Soundscape";
+    soundscapeBox.appendChild(soundscapeTitle);
+    const soundscapeInput = document.createElement("textarea");
+    soundscapeInput.className = "mmd-style-input";
+    soundscapeInput.style.minHeight = "30px";
+    soundscapeInput.placeholder = "e.g. Quiet indoor room tone and a low ventilation hum continue throughout.";
+    soundscapeInput.value = this.timeline.overall_soundscape || "";
+    soundscapeInput.addEventListener("input", () => {
+      this.timeline.overall_soundscape = soundscapeInput.value;
+      this.commitChanges();
+    });
+    soundscapeBox.appendChild(soundscapeInput);
+    this.soundRow.appendChild(soundscapeBox);
+
+    const musicBox = document.createElement("div");
+    musicBox.className = "mmd-box mmd-box-generation";
+    const musicTitle = document.createElement("div");
+    musicTitle.className = "mmd-box-title";
+    musicTitle.textContent = "Non-Diegetic Music";
+    musicBox.appendChild(musicTitle);
+    const musicInput = document.createElement("textarea");
+    musicInput.className = "mmd-style-input";
+    musicInput.style.minHeight = "30px";
+    musicInput.placeholder = "e.g. A restrained solo-piano score at a slow tempo. Leave blank or type N/A for no music.";
+    musicInput.value = this.timeline.non_diegetic_music || "";
+    musicInput.addEventListener("input", () => {
+      this.timeline.non_diegetic_music = musicInput.value;
+      this.commitChanges();
+    });
+    musicBox.appendChild(musicInput);
+    this.soundRow.appendChild(musicBox);
+
+    this.container.appendChild(this.soundRow);
+
     const cutsTitle = document.createElement("div");
     cutsTitle.className = "mmd-section-title";
     cutsTitle.innerHTML = `Timeline <span class="mmd-badge">drag edges to time, drag blocks to reorder</span>`;
@@ -437,6 +543,7 @@ class MinimaxTimelineEditor {
 
     this.renderTimeline();
     this.renderReferences();
+    this._toggleReferenceBox();
   }
 
   // ── Boxed settings panel (re-skins the real native widgets) ────────────────
@@ -530,6 +637,7 @@ class MinimaxTimelineEditor {
     if (this.realWidgets.ref_image_size) {
       this.refBox.appendChild(this._selectRow("Ref Image Size", this.realWidgets.ref_image_size));
     }
+    this.refBox.appendChild(this._dialogueLanguageRow());
     if (this.realWidgets.hybrid_continuation) {
       this.refBox.appendChild(this._boolRow("Hybrid Continuation", this.realWidgets.hybrid_continuation));
       const hint = document.createElement("div");
@@ -542,7 +650,14 @@ class MinimaxTimelineEditor {
   }
 
   _toggleReferenceBox() {
+    const show = this.isReferenceMode() ? "" : "none";
     if (this.refBox) this.refBox.style.display = this.isReferenceMode() ? "block" : "none";
+    // Soundscape/Music are only meaningful in Reference mode — H3's First/Last
+    // Frame checkpoint never encodes reference audio at all, so there's no
+    // overall_soundscape/non_diegetic_music section to fill for that mode.
+    if (this.soundTitle) this.soundTitle.style.display = show;
+    if (this.soundHint) this.soundHint.style.display = show;
+    if (this.soundRow) this.soundRow.style.display = show === "" ? "flex" : "none";
   }
 
   _selectRow(labelText, widget, onChange) {
@@ -612,6 +727,55 @@ class MinimaxTimelineEditor {
       if (widget.callback) widget.callback(widget.value);
       this.node.setDirtyCanvas(true, true);
       if (onChange) onChange();
+    });
+    rowEl.appendChild(input);
+    return rowEl;
+  }
+
+  // Small secondary select bound directly to a timeline_data object field (not a
+  // real ComfyUI widget) — used for retention markers and video role, which only
+  // exist in timeline_data, not as node inputs.
+  _miniSelectRow(labelText, currentValue, options, onChange) {
+    const rowEl = document.createElement("div");
+    rowEl.className = "mmd-mini-row";
+    rowEl.addEventListener("click", (e) => e.stopPropagation());
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    rowEl.appendChild(label);
+
+    const select = document.createElement("select");
+    select.className = "mmd-mini-select";
+    options.forEach((opt) => {
+      const o = document.createElement("option");
+      o.value = opt.value;
+      o.textContent = opt.label;
+      if (opt.value === currentValue) o.selected = true;
+      select.appendChild(o);
+    });
+    select.addEventListener("change", () => {
+      onChange(select.value);
+      this.commitChanges();
+    });
+    rowEl.appendChild(select);
+    return rowEl;
+  }
+
+  // Feeds every <d>[Language]...</d> dialogue tag in the compiled prompt — lives in
+  // timeline_data, not a real widget, same as style_line.
+  _dialogueLanguageRow() {
+    const rowEl = document.createElement("div");
+    rowEl.className = "mmd-lang-row";
+    const label = document.createElement("label");
+    label.textContent = "Dialogue Language";
+    rowEl.appendChild(label);
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "mmd-lang-input";
+    input.value = this.timeline.dialogue_language || "English";
+    input.addEventListener("input", () => {
+      this.timeline.dialogue_language = input.value || "English";
+      this.commitChanges();
     });
     rowEl.appendChild(input);
     return rowEl;
@@ -689,6 +853,36 @@ class MinimaxTimelineEditor {
     track.appendChild(addBtn);
   }
 
+  _buildCutSpeakerRow(seg) {
+    const rowEl = document.createElement("div");
+    rowEl.className = "mmd-cut-speaker-row";
+    const label = document.createElement("label");
+    label.textContent = "Speaker:";
+    rowEl.appendChild(label);
+
+    const select = document.createElement("select");
+    select.className = "mmd-mini-select";
+    const noneOpt = document.createElement("option");
+    noneOpt.value = "";
+    noneOpt.textContent = "(unattributed)";
+    select.appendChild(noneOpt);
+    for (let i = 0; i < MAX_CHARACTER_SLOTS; i++) {
+      const ch = this.timeline.characters[i];
+      if (!ch || !(ch.file || ch.image_b64)) continue;
+      const o = document.createElement("option");
+      o.value = String(i);
+      o.textContent = `Ref ${i + 1}`;
+      if (seg.speakerCharIdx === i) o.selected = true;
+      select.appendChild(o);
+    }
+    select.addEventListener("change", () => {
+      seg.speakerCharIdx = select.value === "" ? null : parseInt(select.value, 10);
+      this.commitChanges();
+    });
+    rowEl.appendChild(select);
+    return rowEl;
+  }
+
   _buildCutBlock(seg, i, totalWeight) {
     const color = CUT_COLORS[i % CUT_COLORS.length];
     const dur = this.durationSeconds;
@@ -737,11 +931,22 @@ class MinimaxTimelineEditor {
     text.className = "mmd-cut-text";
     text.placeholder = "What happens in this shot — action, dialogue, camera move...";
     text.value = seg.prompt || "";
+    block.appendChild(text);
+
+    // Speaker tagging only matters in Reference mode (it drives the (Sx) tag next
+    // to that character's <Subject N> mentions) and only once this CUT actually
+    // has quoted dialogue to attribute — appears/disappears live as you type
+    // rather than needing a full re-render, so it never steals textarea focus.
+    const speakerRow = this.isReferenceMode() ? this._buildCutSpeakerRow(seg) : null;
+    if (speakerRow) {
+      speakerRow.style.display = (seg.prompt || "").includes('"') ? "flex" : "none";
+      block.appendChild(speakerRow);
+    }
     text.addEventListener("input", () => {
       seg.prompt = text.value;
       this.commitChanges();
+      if (speakerRow) speakerRow.style.display = text.value.includes('"') ? "flex" : "none";
     });
-    block.appendChild(text);
 
     // Resize handle (adjusts this block's weight vs. its right neighbor's)
     if (i < this.timeline.segments.length - 1) {
@@ -832,7 +1037,7 @@ class MinimaxTimelineEditor {
     const avHint = document.createElement("div");
     avHint.className = "mmd-track-hint";
     avHint.style.marginTop = "10px";
-    avHint.textContent = "Reference video / audio — upload a clip, skim it with the scrub bar, then Set In / Set Out to pick the exact window that gets sent as a reference. Video slot 1 is reserved internally for chunk-to-chunk continuity once a chunk has a predecessor. A video's own audio is off by default (motion only) — tick \"Include this clip's audio\" to also send it as a paired reference (e.g. for reperforming its dialogue in a different voice). Standalone audio clips don't auto-pair with a character — describe whose voice each one is below, and reference it explicitly in the CUT text (e.g. \"<Picture 1> says, in the voice of <Audio 1>, ...\").";
+    avHint.textContent = "Reference video / audio — upload a clip, skim it with the scrub bar, then Set In / Set Out to pick the exact window that gets sent as a reference. Video slot 1 is reserved internally for chunk-to-chunk continuity once a chunk has a predecessor. A video's own audio is off by default (motion only) — tick \"Include this clip's audio\" to also send it as a paired reference (e.g. for reperforming its dialogue in a different voice). Leave a video's \"Subject description\" blank for a pure motion/camera reference, or fill it in if the video shows a person/element you want reused. Standalone audio clips don't auto-pair with a character — describe whose voice each one is below, and reference it explicitly in the CUT text (e.g. \"<Subject 1> says, in the voice of <Audio 1>, ...\").";
     this.refsArea.appendChild(avHint);
 
     const videoRow = document.createElement("div");
@@ -1056,6 +1261,11 @@ class MinimaxTimelineEditor {
         this.commitChanges();
       });
       wrap.appendChild(descInput);
+
+      wrap.appendChild(this._miniSelectRow(
+        "Retention", entry.retention || "reference", AUDIO_RETENTION_OPTIONS,
+        (v) => { entry.retention = v; },
+      ));
     }
 
     if (kind === "video") {
@@ -1078,6 +1288,26 @@ class MinimaxTimelineEditor {
       audioToggleRow.appendChild(audioToggleLabel);
 
       wrap.appendChild(audioToggleRow);
+
+      const subjectDescInput = document.createElement("textarea");
+      subjectDescInput.className = "mmd-desc-input";
+      subjectDescInput.placeholder = "if this video shows a person/element to reuse, describe them here (creates a Subject) — leave blank for a pure motion/camera reference";
+      subjectDescInput.value = entry.description || "";
+      subjectDescInput.addEventListener("click", (e) => e.stopPropagation());
+      subjectDescInput.addEventListener("input", () => {
+        entry.description = subjectDescInput.value;
+        this.commitChanges();
+      });
+      wrap.appendChild(subjectDescInput);
+
+      wrap.appendChild(this._miniSelectRow(
+        "Role", entry.role || "reference", VIDEO_ROLE_OPTIONS,
+        (v) => { entry.role = v; },
+      ));
+      wrap.appendChild(this._miniSelectRow(
+        "Retention", entry.retention || (entry.description ? "fully_preserved" : "weak_reference"), VISUAL_RETENTION_OPTIONS,
+        (v) => { entry.retention = v; },
+      ));
     }
 
     return wrap;
@@ -1164,6 +1394,13 @@ class MinimaxTimelineEditor {
         this.commitChanges();
       });
       slot.appendChild(descInput);
+
+      if (this.isReferenceMode()) {
+        slot.appendChild(this._miniSelectRow(
+          "Retention", data.retention || "fully_preserved", VISUAL_RETENTION_OPTIONS,
+          (v) => { data.retention = v; },
+        ));
+      }
     } else {
       const placeholder = document.createElement("div");
       placeholder.className = "mmd-char-placeholder";
@@ -1227,9 +1464,9 @@ class MinimaxTimelineEditor {
     const data = isBg ? this.timeline.background : this.timeline.characters[idx];
     try {
       const imageB64 = await this._resolveImageB64(data);
-      // Reuses LTXInfiniteDirector's existing server route rather than duplicating
-      // an Ollama-calling endpoint here — requires that package to be installed.
-      const resp = await api.fetchApi("/muse_director/analyze_character", {
+      // Self-contained route owned by this package (no dependency on any other
+      // Muse package) — tuned to produce <Subject N>-style sentences directly.
+      const resp = await api.fetchApi("/muse_minimax_director/analyze_character", {
         method: "POST",
         body: JSON.stringify({
           image_b64: [imageB64],
@@ -1251,7 +1488,7 @@ class MinimaxTimelineEditor {
       }
     } catch (err) {
       console.error("[MuseMinimaxDirector] analysis request failed", err);
-      alert("Analyze request failed — is ComfyUI running, and is LTXInfiniteDirector installed (this reuses its Ollama route)?");
+      alert("Analyze request failed — is ComfyUI running, and is Ollama (or your chosen provider) reachable?");
       btn.classList.remove("mmd-loading");
       btn.textContent = "Analyze";
     }

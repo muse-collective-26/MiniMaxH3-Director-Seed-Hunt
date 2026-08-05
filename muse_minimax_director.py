@@ -63,12 +63,15 @@ import json
 import logging
 import math
 import os
+import re
 
 import av
 import folder_paths
 import numpy as np
 import torch
 from PIL import Image
+from aiohttp import web
+from server import PromptServer
 
 from comfy_extras.nodes_minimax_h3 import (
     MiniMaxH3ReferenceToVideo, MiniMaxH3ImageToVideo, MiniMaxH3SigmaShift, align_frame_count,
@@ -76,6 +79,152 @@ from comfy_extras.nodes_minimax_h3 import (
 from comfy_extras.nodes_resolution import AspectRatio, ASPECT_RATIOS
 
 log = logging.getLogger(__name__)
+
+
+# ── Character-analysis backend route ────────────────────────────────────────
+# Self-contained (no dependency on any other Muse package) so Analyze works for
+# anyone who installs just this repo. Tuned specifically for MiniMax H3's
+# <Subject N> sentence format: a short identity noun phrase, a comma, then a
+# detail clause of distinguishing features — matching the official guide's own
+# "<Subject N> is the young woman in <Picture N>, with long dark hair..." style
+# directly, rather than a generic caption that then has to be reshaped.
+
+_MUSE_MINIMAX_PROVIDER_DEFAULTS = {
+    "ollama": {"url": "http://127.0.0.1:11434", "model": "huihui_ai/qwen3.5-abliterated:2b"},
+    "lmstudio": {"url": "http://127.0.0.1:1234", "model": ""},
+    "custom": {"url": "", "model": ""},
+    "gemini": {"url": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-2.5-flash"},
+}
+
+_MUSE_MINIMAX_ANALYZE_PROMPT = (
+    "Look at the image and write exactly one sentence describing it, in the form: a short "
+    "identity noun phrase, then a comma, then a detail clause of distinguishing features. "
+    "If the main subject is a person/character, the identity phrase should be something like "
+    "'the young woman' or 'the man with the beard', and the detail clause should cover hair, "
+    "face, build, and clothing. If the main subject is a place/setting, the identity phrase "
+    "should be something like 'the coffee-shop environment' or 'the rooftop at night', and the "
+    "detail clause should cover the distinctive fixtures, colors, and lighting. If it's an "
+    "object, the identity phrase should name it, and the detail clause should cover its shape, "
+    "color, material, and distinctive details. Do not start with 'a photo of' or similar. Do "
+    "not state which category you chose. Output only the single sentence, nothing else."
+)
+
+
+def _muse_minimax_resolve_provider(data):
+    provider = (data.get("provider") or "ollama").lower()
+    defs = _MUSE_MINIMAX_PROVIDER_DEFAULTS.get(provider, _MUSE_MINIMAX_PROVIDER_DEFAULTS["ollama"])
+    base_url = (data.get("base_url") or defs["url"]).rstrip("/")
+    model = data.get("model") or defs["model"]
+    return provider, base_url, model
+
+
+@PromptServer.instance.routes.post("/muse_minimax_director/analyze_character")
+async def muse_minimax_analyze_character_endpoint(request):
+    try:
+        import aiohttp
+        data = await request.json()
+        image_b64 = data.get("image_b64", "")
+        char_index = int(data.get("char_index", 0))
+        provider, base_url, model_name = _muse_minimax_resolve_provider(data)
+
+        if provider == "off":
+            return web.json_response({"status": "error", "message": "Analyze is set to Off / Manual."})
+        if not image_b64:
+            return web.json_response({"status": "error", "message": "No image provided for analysis."})
+
+        b64_list = image_b64 if isinstance(image_b64, list) else [image_b64]
+        cleaned_b64_list = []
+        for b64 in b64_list:
+            if "," in b64:
+                b64 = b64.split(",", 1)[1]
+            cleaned_b64_list.append(b64)
+        if not cleaned_b64_list:
+            return web.json_response({"status": "error", "message": "No valid base64 images decoded."})
+
+        if provider in ("lmstudio", "custom") and not model_name:
+            return web.json_response({
+                "status": "error",
+                "message": f"No model name set for {provider}. Enter your loaded model's name.",
+            })
+
+        log.info("[MuseMinimaxDirector] Analyzing reference %d via %s (%s, model '%s')...",
+                 char_index + 1, provider, base_url, model_name)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                if provider == "ollama":
+                    payload = {
+                        "model": model_name, "prompt": _MUSE_MINIMAX_ANALYZE_PROMPT,
+                        "images": cleaned_b64_list, "stream": False, "keep_alive": 0,
+                    }
+                    async with session.post(f"{base_url}/api/generate", json=payload, timeout=120) as response:
+                        if response.status != 200:
+                            err_txt = await response.text()
+                            return web.json_response({"status": "error", "message": f"Ollama HTTP {response.status}: {err_txt}"})
+                        resp_json = await response.json()
+                        generated_text = (resp_json.get("response") or "").strip()
+                elif provider == "gemini":
+                    api_key = os.environ.get("GEMINI_API_KEY")
+                    if not api_key:
+                        return web.json_response({
+                            "status": "error",
+                            "message": "GEMINI_API_KEY environment variable is not set. Set it and restart ComfyUI.",
+                        })
+                    content = [{"type": "text", "text": _MUSE_MINIMAX_ANALYZE_PROMPT}]
+                    for b64 in cleaned_b64_list:
+                        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+                    payload = {
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": content}],
+                        "max_tokens": 2048, "stream": False,
+                    }
+                    headers = {"Authorization": f"Bearer {api_key}"}
+                    async with session.post(f"{base_url}/chat/completions", json=payload, headers=headers, timeout=120) as response:
+                        if response.status != 200:
+                            err_txt = await response.text()
+                            return web.json_response({"status": "error", "message": f"Gemini HTTP {response.status}: {err_txt}"})
+                        resp_json = await response.json()
+                        try:
+                            msg = resp_json["choices"][0]["message"]
+                            generated_text = (msg.get("content") or "").strip()
+                        except (KeyError, IndexError, TypeError):
+                            return web.json_response({"status": "error", "message": "Unexpected response shape from Gemini."})
+                else:
+                    content = [{"type": "text", "text": _MUSE_MINIMAX_ANALYZE_PROMPT}]
+                    for b64 in cleaned_b64_list:
+                        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+                    payload = {
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": content}],
+                        "max_tokens": 2048, "stream": False,
+                    }
+                    async with session.post(f"{base_url}/v1/chat/completions", json=payload, timeout=120) as response:
+                        if response.status != 200:
+                            err_txt = await response.text()
+                            return web.json_response({"status": "error", "message": f"{provider} HTTP {response.status}: {err_txt}"})
+                        resp_json = await response.json()
+                        try:
+                            msg = resp_json["choices"][0]["message"]
+                            generated_text = (msg.get("content") or "").strip()
+                            if not generated_text:
+                                generated_text = (msg.get("reasoning_content") or "").strip()
+                        except (KeyError, IndexError, TypeError):
+                            return web.json_response({"status": "error", "message": f"Unexpected response shape from {provider}."})
+        except aiohttp.ClientConnectorError:
+            return web.json_response({
+                "status": "error",
+                "message": f"Could not connect to {provider} at {base_url}. Make sure the server is running and reachable.",
+            })
+
+        if "<think>" in generated_text:
+            generated_text = generated_text.split("</think>")[-1].strip()
+
+        log.info("[MuseMinimaxDirector] Reference analysis complete: %s", generated_text)
+        return web.json_response({"status": "success", "description": generated_text})
+
+    except Exception as e:
+        log.error("[MuseMinimaxDirector] Failed to analyze reference: %s", e)
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 MODE_REFERENCE = "Reference (Omni) — up to 9 images, 3 videos, 3 audio"
 MODE_FIRST_LAST = "First/Last Frame — zero, one, or two frame images"
@@ -274,26 +423,30 @@ def _load_ref_audio_clip(entry: dict, target_sr: int = 44100):
         return None
 
 
-def _build_character_ref_images(tdata: dict):
-    """Returns (ref_images_dict, picture_labels_list) for character slots only —
-    background is handled separately per-chunk, since on continuation chunks it gets
-    replaced by a continuity anchor (see the per-chunk loop in execute()).
+def _build_character_subjects(tdata: dict):
+    """Character reference images become both H3's ref_images (dense fill-order
+    Picture tags, same rule as before — MiniMaxH3ReferenceToVideo assigns <Picture N>
+    purely by iteration order over ref_images.values(), confirmed from its own
+    source) AND <Subject N> definitions citing them. Per MiniMax's own reference-mode
+    prompt guide, an image used only to define a character's appearance should NOT
+    get its own standalone <Picture N> entry in the prompt — it belongs inside a
+    <Subject N> definition instead ("cite the image source inside the corresponding
+    <Subject N> definition"). Background is handled separately per-chunk in execute()
+    (its slot gets replaced by a continuity-anchor Picture on continuation chunks),
+    so it isn't part of this function.
 
-    Densely packed in fill order (ref_image_0, ref_image_1, ... with no gaps), NOT
-    keyed by the UI's fixed Ref-N slot index. This matters because MiniMaxH3ReferenceToVideo
-    assigns <Picture N> tags purely by iteration order over ref_images.values() — it never
-    inspects the "ref_image_N" key's own number at all (confirmed directly from its source).
-    An earlier version of this function kept slot position fixed (e.g. background always at
-    ref_image_9), which desynced the compiled prompt's tag numbers from what H3 actually
-    assigned the moment any earlier slot was left empty — e.g. only Ref 1 filled meant H3 saw
-    just two images total and labeled the second one <Picture 2>, while the old prompt text
-    still called it <Picture 10>, a tag that didn't correspond to anything — silently breaking
-    the background/setting reference on most real-world scenes (which rarely fill all 9 slots)."""
+    Returns (ref_images, subject_lines, retention_lines, subject_number_by_char_index).
+    subject_number_by_char_index maps a raw characters[] index -> its assigned
+    <Subject N> number, used to resolve which subject a CUT's speakerCharIdx refers
+    to for (Sx) speaker tagging."""
     characters = tdata.get("characters", [])[:MAX_CHARACTER_SLOTS]
 
-    picture_labels = []
     ref_images = {}
-    for ch in characters:
+    subject_lines = []
+    retention_lines = []
+    subject_number_by_char_index = {}
+
+    for idx, ch in enumerate(characters):
         if not ch or not (ch.get("file") or ch.get("image_b64")):
             continue
         tensor = _load_character_image(ch)
@@ -301,15 +454,29 @@ def _build_character_ref_images(tdata: dict):
             continue
         slot = len(ref_images)
         ref_images[f"ref_image_{slot}"] = tensor
+        picture_n = slot + 1
+        subject_n = len(subject_lines) + 1
+        subject_number_by_char_index[idx] = subject_n
         desc = (ch.get("description") or "").strip()
-        label = f"`<Picture {slot + 1}>`"
-        picture_labels.append(f"{label} = {desc}" if desc else label)
+        if desc:
+            subject_lines.append(f"<Subject {subject_n}> is {desc} (from `<Picture {picture_n}>`).")
+        else:
+            subject_lines.append(f"<Subject {subject_n}> is the subject shown in `<Picture {picture_n}>`.")
+        retention = ch.get("retention") or "fully_preserved"
+        retention_lines.append(
+            f"<Subject {subject_n}> (present throughout): {retention} - matches `<Picture {picture_n}>`.")
 
-    return ref_images, picture_labels
+    return ref_images, subject_lines, retention_lines, subject_number_by_char_index
 
 
 def _build_chunk_prompt(style_line: str, picture_labels: list, audio_labels: list,
                          continuity_notes: list, segments: list) -> str:
+    """Simple flat prompt builder — still used for First/Last Frame mode and for
+    Hybrid Continuation chunks. Neither has a reference-tag system at all
+    (MiniMaxH3ImageToVideo takes a bare prompt + first_frame/last_frame, not the
+    minimax_ref_items tokenizer path), so MiniMax's six-section reference-mode
+    format doesn't apply to them — only Reference (Omni) mode's own non-hybrid
+    chunks use the six-section builder below."""
     parts = []
     if style_line:
         parts.append(style_line)
@@ -331,6 +498,83 @@ def _build_chunk_prompt(style_line: str, picture_labels: list, audio_labels: lis
     return "\n\n".join(parts)
 
 
+_DIALOGUE_RE = re.compile(r'"([^"]*)"')
+_REPEATED_PUNCT_RE = re.compile(r'([.!?,])\1+')
+_DECORATIVE_RE = re.compile(r'[~]{2,}|[*_#]+')
+
+
+def _format_timestamp(seconds: float) -> str:
+    """MM:SS.mmm, per MiniMax's own shot-marker format ('[Shot N] At MM:SS.mmm, ...')."""
+    seconds = max(0.0, seconds)
+    minutes = int(seconds // 60)
+    remainder = seconds - minutes * 60
+    return f"{minutes:02d}:{remainder:06.3f}"
+
+
+def _normalize_dialogue_text(text: str) -> str:
+    """Per the guide's own §5.4 rules: standardize punctuation to basic marks,
+    strip decorative/repeated punctuation, end complete statements with ./?/!."""
+    text = text.strip()
+    text = _DECORATIVE_RE.sub('', text)
+    text = _REPEATED_PUNCT_RE.sub(r'\1', text)
+    text = text.strip()
+    if text and text[-1] not in '.!?':
+        text += '.'
+    return text
+
+
+def _wrap_dialogue(text: str, language: str) -> str:
+    """Wraps every "..."-quoted span in a CUT's text as <d>[Language] ...</d>,
+    the guide's required dialogue/lyric tag — leaves everything outside quotes
+    (including any <Subject N>/<Picture N>/<Video N>/<Audio N> tags) untouched."""
+    def _sub(m):
+        inner = _normalize_dialogue_text(m.group(1))
+        return f"<d>[{language}] {inner}</d>"
+    return _DIALOGUE_RE.sub(_sub, text)
+
+
+def _build_summary_sentence(subject_tags: list, video_continuity_tag: str, carry_audio_tag: str) -> str:
+    """One plain-English sentence naming the chunk's subjects — sits after the
+    bracketed task-type prefix in the summary section. Deliberately simple
+    connective prose; the structural elements (tags, section, task-type bracket)
+    are what the model was actually trained against, not exact phrasing."""
+    if not subject_tags:
+        base = "The target video follows the shot description below."
+    elif len(subject_tags) == 1:
+        base = f"The target video shows {subject_tags[0]}."
+    else:
+        base = f"The target video shows {', '.join(subject_tags[:-1])} and {subject_tags[-1]}."
+    extras = []
+    if video_continuity_tag:
+        extras.append(f"continuing directly from {video_continuity_tag}")
+    if carry_audio_tag:
+        extras.append(f"carrying {carry_audio_tag} forward")
+    if extras:
+        base = base.rstrip(".") + ", " + ", ".join(extras) + "."
+    return base
+
+
+def _assemble_six_section_prompt(subject_lines: list, summary_line: str, retention_lines: list,
+                                  style_line: str, shot_lines: list,
+                                  soundscape_text: str, music_text: str) -> str:
+    """Assembles MiniMax's own six required sections, in their required order, for
+    a single H3 Reference (Omni) mode generation call: subject_definitions, summary,
+    retention_analysis, detailed_description, overall_soundscape, non_diegetic_music."""
+    parts = []
+    if subject_lines:
+        parts.append("subject_definitions:\n" + "\n".join(subject_lines))
+    if summary_line:
+        parts.append("summary:\n" + summary_line)
+    if retention_lines:
+        parts.append("retention_analysis:\n" + "\n".join(retention_lines))
+    desc_lines = ([style_line] if style_line else []) + shot_lines
+    if desc_lines:
+        parts.append("detailed_description:\n" + "\n".join(desc_lines))
+    parts.append("overall_soundscape:\n" + (soundscape_text.strip() if soundscape_text else "N/A"))
+    parts.append("non_diegetic_music:\n" + (music_text.strip() if music_text else "N/A"))
+    return "\n\n".join(parts)
+
+
 def _bucket_segments_into_chunks(tdata: dict, duration_seconds: float, chunk_duration_seconds: float):
     """Splits the timeline's CUT segments into per-chunk groups. Chunks run
     chunk_duration_seconds each, in order, with the final chunk absorbing whatever
@@ -339,8 +583,13 @@ def _bucket_segments_into_chunks(tdata: dict, duration_seconds: float, chunk_dur
     redistributed into N equal-sized pieces (which previously turned that same 15s/10s
     case into two 7.5s chunks — nowhere near what "10s chunks" implies). A remainder
     under H3's own ~4s reliable minimum gets folded into the previous chunk instead of
-    becoming an unreliably short trailing chunk. Returns (buckets, chunk_lengths) —
-    chunk_lengths is a list of per-chunk durations in seconds, same length as buckets."""
+    becoming an unreliably short trailing chunk. Returns (buckets, chunk_lengths, bounds) —
+    chunk_lengths is a list of per-chunk durations in seconds and bounds a list of
+    [start, end] second pairs, both same length as buckets. bounds lets a caller compute
+    each CUT's own [Shot N] At MM:SS.mmm timestamp relative to whichever chunk it lands
+    in, using seg["_abs_start"] (stashed onto each segment dict below) minus that
+    chunk's own start — the exact same timeline positions already shown on the UI's
+    own ruler, not a separately-approximated computation."""
     segments = tdata.get("segments", [])
     total_weight = sum(float(s.get("weight", 1) or 1) for s in segments) or 1.0
 
@@ -366,6 +615,7 @@ def _bucket_segments_into_chunks(tdata: dict, duration_seconds: float, chunk_dur
     for seg in segments:
         seg_start = seg_cursor
         seg_cursor += (float(seg.get("weight", 1) or 1) / total_weight) * duration_seconds
+        seg["_abs_start"] = seg_start
         seg_ranges.append((seg_start, seg_cursor, seg))
 
     # A CUT goes into every chunk its time range overlaps, not just the one
@@ -392,7 +642,7 @@ def _bucket_segments_into_chunks(tdata: dict, duration_seconds: float, chunk_dur
             buckets[chunk_idx].append(seg)
 
     chunk_lengths = [end - start for start, end in bounds]
-    return buckets, chunk_lengths
+    return buckets, chunk_lengths, bounds
 
 
 class MuseMinimaxDirector:
@@ -467,7 +717,9 @@ class MuseMinimaxDirector:
                 seed, steps, sampler_name, scheduler, shift_video, shift_audio, timeline_data,
                 model_fl2va=None):
         tdata = _parse_timeline(timeline_data)
-        char_ref_images, char_picture_labels = _build_character_ref_images(tdata)
+        char_ref_images, subject_lines, subject_retention_lines, subject_number_by_char_index = _build_character_subjects(tdata)
+        subject_count = len(subject_lines)
+        dialogue_language = (tdata.get("dialogue_language") or "English").strip() or "English"
         background = tdata.get("background")
         # First/Last Frame mode has no sockets of its own — Ref 1 / Ref 2 (the same
         # upload UI every other reference uses) double as first_frame/last_frame. Read
@@ -489,7 +741,7 @@ class MuseMinimaxDirector:
         style_line = (tdata.get("style_line") or "").strip()
         width, height = _resolve_resolution(aspect_ratio, megapixels, multiple)
 
-        buckets, chunk_lengths = _bucket_segments_into_chunks(tdata, duration_seconds, chunk_duration_seconds)
+        buckets, chunk_lengths, chunk_bounds = _bucket_segments_into_chunks(tdata, duration_seconds, chunk_duration_seconds)
         num_chunks = len(buckets)
 
         log.info(
@@ -526,7 +778,7 @@ class MuseMinimaxDirector:
         # UI, decoded here from disk. Unchanging across chunks; both share slots with the
         # chunking carry-over below (reserved slot 0 on continuation chunks), so both are
         # merged per-chunk inside the loop rather than built once here.
-        user_ref_videos = []  # list of (frames_tensor, paired_audio_dict_or_None)
+        user_ref_videos = []  # list of (frames_tensor, paired_audio_dict_or_None, entry_dict)
         for entry in (tdata.get("refVideos") or [])[:3]:
             if not entry or not entry.get("file"):
                 continue
@@ -537,15 +789,15 @@ class MuseMinimaxDirector:
             # embedded audio track (PyAV doesn't care whether the container is "video" or
             # "audio", it just reads whichever stream exists) — no separate decode path needed.
             paired_audio = _load_ref_audio_clip(entry) if entry.get("includeAudio") else None
-            user_ref_videos.append((tensor, paired_audio))
+            user_ref_videos.append((tensor, paired_audio, entry))
 
-        user_ref_audios = []  # list of (AUDIO dict, description) in slot order
+        user_ref_audios = []  # list of (AUDIO dict, entry_dict) in slot order
         for entry in (tdata.get("refAudios") or [])[:3]:
             if not entry or not entry.get("file"):
                 continue
             clip_audio = _load_ref_audio_clip(entry)
             if clip_audio is not None:
-                user_ref_audios.append((clip_audio, (entry.get("description") or "").strip()))
+                user_ref_audios.append((clip_audio, entry))
 
         all_images = []
         all_waveform = None
@@ -558,6 +810,7 @@ class MuseMinimaxDirector:
             chunk_len_seconds = chunk_lengths[chunk_idx]
             chunk_length = align_frame_count(max(5, round(chunk_len_seconds * 24)))
             is_last_chunk = chunk_idx == num_chunks - 1
+            chunk_start_sec = chunk_bounds[chunk_idx][0]
 
             chunk_ref_videos = None
             chunk_ref_audios = None
@@ -595,6 +848,15 @@ class MuseMinimaxDirector:
                         "unless the shot description explicitly includes spoken lines."
                     )
             elif mode == MODE_REFERENCE:
+                # Non-hybrid Reference (Omni) chunks are the only case that gets
+                # MiniMax's own six-section reference-mode prompt format — hybrid
+                # chunks and First/Last Frame mode route through MiniMaxH3ImageToVideo,
+                # which has no reference-tag system for the format to apply to.
+                chunk_subject_lines = list(subject_lines)
+                chunk_retention_lines = list(subject_retention_lines)
+                chunk_subject_tags = [f"<Subject {i + 1}>" for i in range(subject_count)]
+                task_flags = set()
+
                 # Carry-over continuity always claims slot 0 of both ref_videos and
                 # ref_audios once a chunk has a predecessor — H3 allows 3 of each, so
                 # user-provided references fill whatever slots are left after that.
@@ -610,17 +872,45 @@ class MuseMinimaxDirector:
                 if prev_chunk_images is not None:
                     chunk_ref_videos[f"ref_video_{video_slot}"] = prev_chunk_images
                     video_continuity_tag = f"<Video {video_slot + 1}>"
+                    chunk_retention_lines.append(
+                        f"{video_continuity_tag} (continuation source): fully_preserved - continues directly "
+                        "from the immediately preceding shot's final moment, same action and camera framing."
+                    )
+                    task_flags.add("video continuation")
                     video_slot += 1
-                for v, paired_audio in user_ref_videos:
+                for v, paired_audio, meta in user_ref_videos:
                     if video_slot > 2:
                         log.warning("[MuseMinimaxDirector] ref_video slots full (3 max, one reserved for chunk "
                                     "carry-over) — dropping an extra user-provided reference video.")
                         break
+                    tag_n = video_slot + 1
                     chunk_ref_videos[f"ref_video_{video_slot}"] = v
+                    role = meta.get("role") or "reference"
+                    if role == "editing_source":
+                        task_flags.add("video editing")
+                    elif role == "continuation_source":
+                        task_flags.add("video continuation")
+                    v_desc = (meta.get("description") or "").strip()
+                    v_retention = meta.get("retention") or ("fully_preserved" if v_desc else "weak_reference")
+                    if v_desc:
+                        subj_n = len(chunk_subject_tags) + 1
+                        chunk_subject_tags.append(f"<Subject {subj_n}>")
+                        chunk_subject_lines.append(f"<Subject {subj_n}> is {v_desc} (from `<Video {tag_n}>`).")
+                        chunk_retention_lines.append(f"<Subject {subj_n}> (from `<Video {tag_n}>`): {v_retention} - {v_desc}.")
+                    else:
+                        chunk_retention_lines.append(
+                            f"`<Video {tag_n}>` (camera/motion reference): {v_retention} - only structural/camera "
+                            "characteristics are retained; no visible content is reused."
+                        )
                     if paired_audio is not None:
                         chunk_ref_video_audios[f"ref_video_audio_{video_slot}"] = paired_audio
                         audio_tag_counter += 1
-                        audio_labels.append(f"`<Audio {audio_tag_counter}>` = the audio from `<Video {video_slot + 1}>`")
+                        chunk_subject_lines.append(f"<Audio {audio_tag_counter}> is the audio of `<Video {tag_n}>`.")
+                        chunk_retention_lines.append(
+                            f"<Audio {audio_tag_counter}>: reference - guides voice timbre/delivery without "
+                            "copying the original signal."
+                        )
+                        task_flags.add("audio reference")
                     video_slot += 1
 
                 chunk_ref_audios = {}
@@ -635,59 +925,109 @@ class MuseMinimaxDirector:
                     chunk_ref_audios[f"ref_audio_{audio_slot}"] = {"waveform": tail_wave, "sample_rate": tail_sr}
                     audio_tag_counter += 1
                     carry_audio_tag = f"<Audio {audio_tag_counter}>"
-                    audio_labels.append(f"`{carry_audio_tag}` = the tail end of the previous shot's own score/ambience")
+                    chunk_retention_lines.append(
+                        f"{carry_audio_tag} (previous shot's tail): partially_copy - the tail end of the "
+                        "previous shot's own score/ambience continues into this one."
+                    )
+                    task_flags.add("audio reuse")
                     audio_slot += 1
-                for clip_audio, desc in user_ref_audios:
+                for clip_audio, meta in user_ref_audios:
                     if audio_slot > 2:
                         log.warning("[MuseMinimaxDirector] ref_audio slots full (3 max, one reserved for chunk "
                                     "carry-over once a chunk has a predecessor) — dropping an extra reference audio clip.")
                         break
                     chunk_ref_audios[f"ref_audio_{audio_slot}"] = clip_audio
                     audio_tag_counter += 1
-                    label = f"`<Audio {audio_tag_counter}>`"
-                    audio_labels.append(f"{label} = {desc}" if desc else label)
+                    a_desc = (meta.get("description") or "").strip()
+                    a_retention = meta.get("retention") or "reference"
+                    if a_desc:
+                        chunk_subject_lines.append(f"<Audio {audio_tag_counter}> is the voice-timbre reference described as: {a_desc}.")
+                    else:
+                        chunk_subject_lines.append(f"<Audio {audio_tag_counter}> is a voice-timbre reference.")
+                    chunk_retention_lines.append(
+                        f"<Audio {audio_tag_counter}>: {a_retention} - "
+                        + (a_desc if a_desc else "guides dialogue delivery without copying the original signal.")
+                    )
+                    task_flags.add("audio reuse" if a_retention in ("fully_copy", "partially_copy") else "audio reference")
                     audio_slot += 1
-
-                if video_continuity_tag:
-                    continuity_notes.append(
-                        f"{video_continuity_tag} is the final moment of the immediately preceding shot — continue "
-                        "the same action, camera framing, and motion seamlessly from exactly where it left off. "
-                        "No cut, no restart, and no change of camera angle unless the shot description below "
-                        "explicitly calls for one."
-                    )
-                if carry_audio_tag:
-                    continuity_notes.append(
-                        f"Continue the same music, score, and ambience from `{carry_audio_tag}` through this shot "
-                        "rather than starting a new piece of music or resetting the soundscape."
-                    )
 
                 # Reference images: characters are always present; the fixed background
                 # slot holds either the real background image (first chunk / no
-                # predecessor) or, on continuation chunks, the previous chunk's own last
-                # frame as an explicitly-labeled continuity anchor — a much more direct
-                # "continue from exactly here" signal than the same frame sitting buried
-                # inside the full ref_video, and auto-cross-referenced to the character's
-                # own <Picture N> tag rather than making the user retype it per chunk.
+                # predecessor, wrapped as its own <Subject N> the same way characters
+                # are) or, on continuation chunks, the previous chunk's own last frame
+                # as a standalone <Picture N> keyframe anchor — per the guide's own
+                # carve-out, a genuine first/last/keyframe anchor gets a standalone
+                # Picture entry rather than being wrapped as a Subject.
                 chunk_ref_images = dict(char_ref_images)
-                chunk_picture_labels = list(char_picture_labels)
+                shot1_prefix = ""
                 if prev_chunk_images is not None:
                     last_frame_still = prev_chunk_images[-1:]
                     chunk_ref_images[f"ref_image_{bg_index}"] = last_frame_still
-                    cross_ref = " `<Picture 1>` continues the same ongoing action directly from this point." if char_ref_images else ""
-                    chunk_picture_labels.append(
-                        f"`<Picture {bg_index + 1}>` = continuity anchor — the exact framing, pose, and camera "
-                        f"angle at the end of the previous shot.{cross_ref} No cut, no new take."
+                    anchor_n = bg_index + 1
+                    chunk_retention_lines.append(
+                        f"`<Picture {anchor_n}>` ([Shot 1] first-frame anchor): fully_preserved - the exact "
+                        "framing, pose, and camera angle at the end of the previous shot."
+                    )
+                    task_flags.add("keyframe completion")
+                    shot1_prefix = (
+                        f"The shot begins from `<Picture {anchor_n}>`, continuing directly from the previous "
+                        "shot's exact framing and pose. "
                     )
                 elif background and (background.get("file") or background.get("image_b64")):
                     tensor = _load_character_image(background)
                     if tensor is not None:
                         chunk_ref_images[f"ref_image_{bg_index}"] = tensor
+                        bg_picture_n = bg_index + 1
+                        bg_subj_n = len(chunk_subject_tags) + 1
+                        chunk_subject_tags.append(f"<Subject {bg_subj_n}>")
                         bg_desc = (background.get("description") or "").strip()
-                        chunk_picture_labels.append(
-                            f"`<Picture {bg_index + 1}>` = the setting" + (f" ({bg_desc})" if bg_desc else "")
-                        )
+                        if bg_desc:
+                            chunk_subject_lines.append(f"<Subject {bg_subj_n}> is {bg_desc} (from `<Picture {bg_picture_n}>`).")
+                        else:
+                            chunk_subject_lines.append(f"<Subject {bg_subj_n}> is the setting shown in `<Picture {bg_picture_n}>`.")
+                        bg_retention = background.get("retention") or "fully_preserved"
+                        chunk_retention_lines.append(
+                            f"<Subject {bg_subj_n}> (present throughout): {bg_retention} - matches `<Picture {bg_picture_n}>`.")
 
-            chunk_prompt = _build_chunk_prompt(style_line, chunk_picture_labels, audio_labels, continuity_notes, chunk_segments)
+                task_bits = ["reference generation"]
+                for t in ("video editing", "video continuation", "keyframe completion", "audio reuse", "audio reference"):
+                    if t in task_flags:
+                        task_bits.append(t)
+                summary_line = f"[{' + '.join(task_bits)}] " + _build_summary_sentence(
+                    chunk_subject_tags, video_continuity_tag, carry_audio_tag)
+
+                shot_lines = []
+                speaker_assign = {}
+                for j, seg in enumerate(chunk_segments):
+                    text = (seg.get("prompt") or "").strip()
+                    if not text:
+                        continue
+                    speaker_idx = seg.get("speakerCharIdx")
+                    if speaker_idx is not None and speaker_idx in subject_number_by_char_index:
+                        subj_n = subject_number_by_char_index[speaker_idx]
+                        if subj_n not in speaker_assign:
+                            speaker_assign[subj_n] = len(speaker_assign) + 1
+                        text = text.replace(f"<Subject {subj_n}>", f"<Subject {subj_n}> (S{speaker_assign[subj_n]})")
+                    text = _wrap_dialogue(text, dialogue_language)
+                    if j == 0:
+                        shot_lines.append(f"[Shot 1] {shot1_prefix}{text}")
+                    else:
+                        start_in_chunk = max(0.0, seg.get("_abs_start", 0.0) - chunk_start_sec)
+                        shot_lines.append(f"[Shot {j + 1}] At {_format_timestamp(start_in_chunk)}, {text}")
+
+                soundscape_text = (tdata.get("overall_soundscape") or "").strip()
+                music_text = (tdata.get("non_diegetic_music") or "").strip()
+                if carry_audio_tag:
+                    suffix = f"The copied ambience layer from `{carry_audio_tag}` continues throughout."
+                    soundscape_text = (soundscape_text + " " + suffix) if soundscape_text else suffix
+
+                chunk_prompt = _assemble_six_section_prompt(
+                    chunk_subject_lines, summary_line, chunk_retention_lines,
+                    style_line, shot_lines, soundscape_text, music_text,
+                )
+
+            if mode != MODE_REFERENCE or use_hybrid_chunk:
+                chunk_prompt = _build_chunk_prompt(style_line, chunk_picture_labels, audio_labels, continuity_notes, chunk_segments)
             compiled_prompts.append(f"--- Chunk {chunk_idx + 1}/{num_chunks} (~{chunk_len_seconds:.1f}s) ---\n{chunk_prompt}")
 
             log.info("[MuseMinimaxDirector] chunk %d/%d, length=%d frames, video_carry=%s, audio_carry=%s, hybrid=%s",
