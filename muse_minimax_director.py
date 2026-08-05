@@ -533,6 +533,17 @@ def _wrap_dialogue(text: str, language: str) -> str:
     return _DIALOGUE_RE.sub(_sub, text)
 
 
+def _seg_speaker_indices(seg: dict) -> list:
+    """A CUT's speaking characters — the current multi-select field, with a
+    fallback to the older single-speaker field for timelines saved before the
+    multi-speaker redesign."""
+    idxs = seg.get("speakerCharIdxs")
+    if isinstance(idxs, list) and idxs:
+        return idxs
+    legacy = seg.get("speakerCharIdx")
+    return [legacy] if legacy is not None else []
+
+
 def _build_summary_sentence(subject_tags: list, video_continuity_tag: str, carry_audio_tag: str) -> str:
     """One plain-English sentence naming the chunk's subjects — sits after the
     bracketed task-type prefix in the summary section. Deliberately simple
@@ -791,13 +802,17 @@ class MuseMinimaxDirector:
             paired_audio = _load_ref_audio_clip(entry) if entry.get("includeAudio") else None
             user_ref_videos.append((tensor, paired_audio, entry))
 
-        user_ref_audios = []  # list of (AUDIO dict, entry_dict) in slot order
-        for entry in (tdata.get("refAudios") or [])[:3]:
+        # list of (AUDIO dict, entry_dict, original_ui_index) — the original index
+        # (not the filtered position here) is what Ref Audio N <-> Ref N positional
+        # voice-pairing checks against, e.g. Ref Audio 3 only pairs with Ref 3 even
+        # if Ref Audio 1/2 were left empty and this ends up first in the list.
+        user_ref_audios = []
+        for ui_idx, entry in enumerate((tdata.get("refAudios") or [])[:3]):
             if not entry or not entry.get("file"):
                 continue
             clip_audio = _load_ref_audio_clip(entry)
             if clip_audio is not None:
-                user_ref_audios.append((clip_audio, entry))
+                user_ref_audios.append((clip_audio, entry, ui_idx))
 
         all_images = []
         all_waveform = None
@@ -863,6 +878,23 @@ class MuseMinimaxDirector:
                 chunk_audio_subject_lines = []
                 chunk_audio_retention_lines = []
                 task_flags = set()
+
+                # Speaker IDs are assigned in one pre-pass over every CUT in this chunk,
+                # before subject_definitions gets built — a paired ref_audio's own
+                # definition line needs to already know its character's (Sx) number
+                # (per the guide's own pattern: "<Audio 1> is the voice-timbre reference
+                # for <Subject 3> (S1)"), and that requires knowing every speaking
+                # character's assignment up front rather than discovering it only once
+                # detailed_description is built afterwards.
+                speaker_assign = {}
+                for seg in chunk_segments:
+                    if not (seg.get("prompt") or "").strip():
+                        continue
+                    for char_idx in _seg_speaker_indices(seg):
+                        if char_idx in subject_number_by_char_index:
+                            subj_n = subject_number_by_char_index[char_idx]
+                            if subj_n not in speaker_assign:
+                                speaker_assign[subj_n] = len(speaker_assign) + 1
 
                 # Carry-over continuity always claims slot 0 of both ref_videos and
                 # ref_audios once a chunk has a predecessor — H3 allows 3 of each, so
@@ -939,7 +971,7 @@ class MuseMinimaxDirector:
                     )
                     task_flags.add("audio reuse")
                     audio_slot += 1
-                for clip_audio, meta in user_ref_audios:
+                for clip_audio, meta, ui_idx in user_ref_audios:
                     if audio_slot > 2:
                         log.warning("[MuseMinimaxDirector] ref_audio slots full (3 max, one reserved for chunk "
                                     "carry-over once a chunk has a predecessor) — dropping an extra reference audio clip.")
@@ -948,7 +980,17 @@ class MuseMinimaxDirector:
                     audio_tag_counter += 1
                     a_desc = (meta.get("description") or "").strip()
                     a_retention = meta.get("retention") or "reference"
-                    if a_desc:
+                    # Positional pairing: Ref Audio N is always Ref (character) N's
+                    # voice, by array index — matches the guide's own preferred phrasing
+                    # ("<Audio N> is the voice-timbre reference for <Subject M> (Sx)")
+                    # instead of a generic, unlinked description.
+                    paired_subj_n = subject_number_by_char_index.get(ui_idx)
+                    if paired_subj_n is not None:
+                        sx = speaker_assign.get(paired_subj_n)
+                        sx_suffix = f" (S{sx})" if sx else ""
+                        chunk_audio_subject_lines.append(
+                            f"<Audio {audio_tag_counter}> is the voice-timbre reference for `<Subject {paired_subj_n}>`{sx_suffix}.")
+                    elif a_desc:
                         chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is the voice-timbre reference described as: {a_desc}.")
                     else:
                         chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is a voice-timbre reference.")
@@ -1005,26 +1047,34 @@ class MuseMinimaxDirector:
                     chunk_subject_tags, video_continuity_tag, carry_audio_tag)
 
                 shot_lines = []
-                speaker_assign = {}
                 for j, seg in enumerate(chunk_segments):
                     text = (seg.get("prompt") or "").strip()
                     if not text:
                         continue
-                    speaker_idx = seg.get("speakerCharIdx")
-                    if speaker_idx is not None and speaker_idx in subject_number_by_char_index:
-                        subj_n = subject_number_by_char_index[speaker_idx]
-                        if subj_n not in speaker_assign:
-                            speaker_assign[subj_n] = len(speaker_assign) + 1
+                    # speaker_assign was already computed in the pre-pass above — reused
+                    # here, not rebuilt, so a paired audio's own subject_definitions line
+                    # and this CUT's (Sx) tag always agree on the same speaker number.
+                    speaker_idxs = _seg_speaker_indices(seg)
+                    tagged_any = False
+                    for char_idx in speaker_idxs:
+                        subj_n = subject_number_by_char_index.get(char_idx)
+                        s_n = speaker_assign.get(subj_n) if subj_n is not None else None
+                        if not s_n:
+                            continue
                         subj_tag = f"<Subject {subj_n}>"
-                        tagged = f"{subj_tag} (S{speaker_assign[subj_n]})"
                         if subj_tag in text:
-                            text = text.replace(subj_tag, tagged)
-                        else:
-                            # CUT text doesn't mention the subject tag at all (e.g. a CUT
-                            # that's pure dialogue continuing a conversation) — without this,
-                            # picking a Speaker in the UI silently had no effect on the
-                            # compiled prompt, since there was nothing for it to attach to.
-                            text = f"{tagged} continues: {text}"
+                            text = text.replace(subj_tag, f"{subj_tag} (S{s_n})")
+                            tagged_any = True
+                    # Only auto-attribute an untagged line when this CUT has exactly one
+                    # speaker selected — with two or more, there's no safe way to guess
+                    # which one owns dialogue that doesn't mention either tag, so leave
+                    # it for the user to tag explicitly (e.g. type <Subject 2> themselves)
+                    # rather than risk attributing someone else's line to the wrong voice.
+                    if not tagged_any and len(speaker_idxs) == 1:
+                        subj_n = subject_number_by_char_index.get(speaker_idxs[0])
+                        s_n = speaker_assign.get(subj_n) if subj_n is not None else None
+                        if s_n:
+                            text = f"<Subject {subj_n}> (S{s_n}) continues: {text}"
                     text = _wrap_dialogue(text, dialogue_language)
                     if j == 0:
                         shot_lines.append(f"[Shot 1] {shot1_prefix}{text}")

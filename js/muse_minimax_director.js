@@ -280,6 +280,7 @@ function injectStyles() {
     display: flex; align-items: center; gap: 6px; margin-top: 6px; cursor: pointer;
     font-size: 9px; color: #9a9aa8;
   }
+  .mmd-audio-pair-note { font-size: 9px; color: #6a9a7a; margin-bottom: 4px; line-height: 1.4; }
 
   /* Small secondary selectors (retention markers, video role, CUT speaker) — kept
      visually secondary via color/weight, NOT via tiny type — legibility comes
@@ -297,9 +298,17 @@ function injectStyles() {
   .mmd-mini-select option { background: #1a1a22; color: #e4e4ea; font-size: 11.5px; }
 
   .mmd-cut-speaker-row {
-    display: flex; align-items: center; gap: 8px; padding: 0 7px 8px 7px;
+    display: flex; align-items: center; gap: 6px; padding: 0 7px 8px 7px; flex-wrap: wrap;
   }
   .mmd-cut-speaker-row label { font-size: 11px; color: #8a8a98; white-space: nowrap; }
+  .mmd-speaker-chip {
+    background: #101015; border: 1px solid #2e2e3a; border-radius: 20px; color: #8a8a98;
+    font-size: 10.5px; padding: 3px 10px; cursor: pointer; transition: all 0.15s ease;
+  }
+  .mmd-speaker-chip:hover { border-color: #4F8EF7; color: #d4d4dc; }
+  .mmd-speaker-chip-active {
+    background: #4F8EF722; border-color: #4F8EF7; color: #cfe0ff;
+  }
 
   .mmd-lang-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 0; border-top: 1px solid #22222b; }
   .mmd-lang-row label { font-size: 10.5px; color: #9a9aa8; white-space: nowrap; }
@@ -856,33 +865,37 @@ class MinimaxTimelineEditor {
     track.appendChild(addBtn);
   }
 
+  // Multi-select, not single — a CUT is one shot, but a shot can have more than
+  // one person talking in it (a whole 5s clip is often one continuous shot with
+  // two or three characters in it, not one cut per line of dialogue). Whichever
+  // Ref chips are ticked here each get their own (Sx) tag wherever their own
+  // <Subject N> appears in this CUT's text, and each keeps their own paired
+  // voice (Ref Audio N <-> Ref N by position) automatically.
   _buildCutSpeakerRow(seg) {
+    if (!Array.isArray(seg.speakerCharIdxs)) seg.speakerCharIdxs = [];
     const rowEl = document.createElement("div");
     rowEl.className = "mmd-cut-speaker-row";
     const label = document.createElement("label");
-    label.textContent = "Speaker:";
+    label.textContent = "Who's speaking:";
     rowEl.appendChild(label);
 
-    const select = document.createElement("select");
-    select.className = "mmd-mini-select";
-    const noneOpt = document.createElement("option");
-    noneOpt.value = "";
-    noneOpt.textContent = "(unattributed)";
-    select.appendChild(noneOpt);
     for (let i = 0; i < MAX_CHARACTER_SLOTS; i++) {
       const ch = this.timeline.characters[i];
       if (!ch || !(ch.file || ch.image_b64)) continue;
-      const o = document.createElement("option");
-      o.value = String(i);
-      o.textContent = `Ref ${i + 1}`;
-      if (seg.speakerCharIdx === i) o.selected = true;
-      select.appendChild(o);
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "mmd-speaker-chip" + (seg.speakerCharIdxs.includes(i) ? " mmd-speaker-chip-active" : "");
+      chip.textContent = `Ref ${i + 1}`;
+      chip.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const idx = seg.speakerCharIdxs.indexOf(i);
+        if (idx === -1) seg.speakerCharIdxs.push(i);
+        else seg.speakerCharIdxs.splice(idx, 1);
+        chip.classList.toggle("mmd-speaker-chip-active");
+        this.commitChanges();
+      });
+      rowEl.appendChild(chip);
     }
-    select.addEventListener("change", () => {
-      seg.speakerCharIdx = select.value === "" ? null : parseInt(select.value, 10);
-      this.commitChanges();
-    });
-    rowEl.appendChild(select);
     return rowEl;
   }
 
@@ -1040,7 +1053,7 @@ class MinimaxTimelineEditor {
     const avHint = document.createElement("div");
     avHint.className = "mmd-track-hint";
     avHint.style.marginTop = "10px";
-    avHint.textContent = "Reference video / audio — upload a clip, skim it with the scrub bar, then Set In / Set Out to pick the exact window that gets sent as a reference. Video slot 1 is reserved internally for chunk-to-chunk continuity once a chunk has a predecessor. A video's own audio is off by default (motion only) — tick \"Include this clip's audio\" to also send it as a paired reference (e.g. for reperforming its dialogue in a different voice). Leave a video's \"Subject description\" blank for a pure motion/camera reference, or fill it in if the video shows a person/element you want reused. Standalone audio clips don't auto-pair with a character — describe whose voice each one is below, and reference it explicitly in the CUT text (e.g. \"<Subject 1> says, in the voice of <Audio 1>, ...\").";
+    avHint.textContent = "Reference video / audio — upload a clip, skim it with the scrub bar, then Set In / Set Out to pick the exact window that gets sent as a reference. Video slot 1 is reserved internally for chunk-to-chunk continuity once a chunk has a predecessor. A video's own audio is off by default (motion only) — tick \"Include this clip's audio\" to also send it as a paired reference (e.g. for reperforming its dialogue in a different voice). Leave a video's \"Subject description\" blank for a pure motion/camera reference, or fill it in if the video shows a person/element you want reused. Ref Audio N automatically becomes Ref N's voice (Ref Audio 1 = Ref 1's voice, Ref Audio 2 = Ref 2's, etc.) — no need to describe whose voice it is, and no need to mention it in your CUT text. Just tick which characters are speaking on each CUT below and their paired voice is used automatically.";
     this.refsArea.appendChild(avHint);
 
     const videoRow = document.createElement("div");
@@ -1254,9 +1267,23 @@ class MinimaxTimelineEditor {
     wrap.appendChild(filename);
 
     if (kind === "audio") {
+      // Ref Audio N auto-pairs with Ref (character) N by position — Ref Audio 1 is
+      // always Ref 1's voice, Ref Audio 2 is always Ref 2's, etc. No need to
+      // describe whose voice it is when that's already known from the pairing;
+      // the description field below only matters as a fallback when there's no
+      // character in the matching Ref slot (e.g. an off-screen voice).
+      const pairedChar = this.timeline.characters[idx];
+      const pairedFilled = pairedChar && (pairedChar.file || pairedChar.image_b64);
+      const pairNote = document.createElement("div");
+      pairNote.className = "mmd-audio-pair-note";
+      pairNote.textContent = pairedFilled
+        ? `Paired with Ref ${idx + 1} — this is automatically her/his voice reference.`
+        : `No character in Ref ${idx + 1} — describe the voice below, or leave blank for an unattributed reference.`;
+      wrap.appendChild(pairNote);
+
       const descInput = document.createElement("textarea");
       descInput.className = "mmd-desc-input";
-      descInput.placeholder = "whose voice is this? e.g. \"Sarah — warm, mid-range\"";
+      descInput.placeholder = "optional — only used when there's no matching character, e.g. \"Sarah — warm, mid-range\"";
       descInput.value = entry.description || "";
       descInput.addEventListener("click", (e) => e.stopPropagation());
       descInput.addEventListener("input", () => {
