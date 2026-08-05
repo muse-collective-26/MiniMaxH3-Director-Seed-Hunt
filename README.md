@@ -113,6 +113,21 @@ You will also need a matching CLIP text encoder, a video VAE, and an audio VAE �
 
 ---
 
+## Example workflow
+
+A ready-to-load workflow is included at [`workflows/muse_minimax_h3_director.json`](workflows/muse_minimax_h3_director.json) — model loaders wired up, sigma-shift patches applied, and `MuseMinimaxDirector` connected straight through to a Video Combine node. Reference slots are left empty on purpose so you drop in your own characters and location rather than inheriting someone else's.
+
+It also uses a few extra nodes purely for convenience/performance, on top of what's required above — search ComfyUI Manager for these if they show as missing when you load it:
+
+- **KJNodes** (`ModelPreviewOverrideKJ`) — a model-preview wrapper, purely decorative, safe to delete and rewire straight through if you don't have it
+- **ComfyUI-LayerStyle** (`LayerUtility: PurgeVRAM`) — clears VRAM between preview steps, not required for generation to work
+- A text-preview node (`iToolsPreviewText`) showing the `compiled_prompt` output — swap for any other STRING preview node (e.g. "Show Text" from ComfyUI-Custom-Scripts) if you don't have this one
+- A SageAttention memory-efficiency patch (`MiniMaxH3MemoryEfficientSageAttentionPatch`) applied to the model — optional; the node still runs without it, just less memory-efficient
+
+None of these are needed for `MuseMinimaxDirector` itself to work — only for this specific example graph exactly as saved.
+
+---
+
 ## Full node reference
 
 ### Inputs
