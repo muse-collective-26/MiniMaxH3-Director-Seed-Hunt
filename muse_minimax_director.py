@@ -734,7 +734,7 @@ class MuseMinimaxDirector:
         last_frame = _load_character_image(characters_raw[1]) if len(characters_raw) > 1 and characters_raw[1] else None
         # Background/continuity-anchor slot: the next free dense position after however
         # many character images actually made it into char_ref_images — NOT a fixed index
-        # — same reasoning as _build_character_ref_images: H3 tags by iteration order, so
+        # — same reasoning as _build_character_subjects: H3 tags by iteration order, so
         # this must land wherever the character images actually stopped, not at a fixed
         # slot number that only happens to be correct when all 9 character slots are full.
         bg_index = len(char_ref_images)
