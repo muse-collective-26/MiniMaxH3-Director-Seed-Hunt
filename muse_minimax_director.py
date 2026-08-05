@@ -750,10 +750,12 @@ class MuseMinimaxDirector:
                 "timeline_data": ("STRING", {"default": "{}", "multiline": False}),
             },
             "optional": {
-                "model_fl2va": ("MODEL", {"tooltip": "Only used when hybrid_continuation is on. The separate "
-                    "First/Last-Frame checkpoint (not the same weights as the main Reference/Omni model input) "
-                    "— load it via its own loader, bypassed when hybrid_continuation is off, same idea as "
-                    "switching between the two mode checkpoints."}),
+                "model_fl2va": ("MODEL", {"tooltip": "The separate First/Last-Frame checkpoint (not the same "
+                    "weights as the main Reference/Omni model input) — load it via its own loader. Used whenever "
+                    "a First/Last-Frame-style generation actually happens: First/Last Frame mode itself, and "
+                    "Hybrid Continuation's chunk-to-chunk lock while in Reference mode. If left unconnected, "
+                    "First/Last Frame mode falls back to the main model input instead — which should normally "
+                    "hold the Reference/ref2va checkpoint, not this one, so results may be degraded."}),
                 # Reference (Omni) mode only. Up to 3 reference videos and 3 reference audio
                 # clips, uploaded and scrub-trimmed directly in the timeline UI (timeline_data's
                 # refVideos/refAudios) rather than as graph sockets — same convention as the
@@ -817,15 +819,25 @@ class MuseMinimaxDirector:
         shifted_model = _unpack_node_result(_execute_comfy_node(
             MiniMaxH3SigmaShift, model=model, shift_video=shift_video, shift_audio=shift_audio,
         ))[0]
+        # Computed once whenever model_fl2va is connected, not just for Hybrid
+        # Continuation — First/Last Frame mode needs the exact same shifted fl2va
+        # checkpoint for its own MiniMaxH3ImageToVideo calls, since that node
+        # expects fl2va weights specifically, not the Reference/ref2va checkpoint
+        # sitting in the main model input.
         shifted_model_fl2va = None
-        use_hybrid = mode == MODE_REFERENCE and hybrid_continuation and model_fl2va is not None
-        if use_hybrid:
+        if model_fl2va is not None:
             shifted_model_fl2va = _unpack_node_result(_execute_comfy_node(
                 MiniMaxH3SigmaShift, model=model_fl2va, shift_video=shift_video, shift_audio=shift_audio,
             ))[0]
-        elif mode == MODE_REFERENCE and hybrid_continuation and model_fl2va is None:
+        use_hybrid = mode == MODE_REFERENCE and hybrid_continuation and model_fl2va is not None
+        if mode == MODE_REFERENCE and hybrid_continuation and model_fl2va is None:
             log.warning("[MuseMinimaxDirector] hybrid_continuation is on but model_fl2va isn't connected — "
                         "falling back to normal Reference (Omni) continuity for every chunk.")
+        elif mode == MODE_FIRST_LAST and model_fl2va is None:
+            log.warning("[MuseMinimaxDirector] First/Last Frame mode has no model_fl2va connected — falling "
+                        "back to the main model input, which should normally hold the Reference/ref2va "
+                        "checkpoint, not the First/Last-Frame one. Results may be degraded; wire the fl2va "
+                        "checkpoint into model_fl2va for correct output.")
         sampler = _unpack_node_result(_execute_comfy_node(KSamplerSelect, sampler_name=sampler_name))[0]
 
         # User-provided reference videos/audio — uploaded and scrub-trimmed in the timeline
@@ -1190,7 +1202,10 @@ class MuseMinimaxDirector:
                     width=width, height=height, length=chunk_length,
                     first_frame=chunk_first, last_frame=chunk_last,
                 )
-                chunk_shifted_model = shifted_model
+                # Prefer the real fl2va checkpoint when connected — MiniMaxH3ImageToVideo
+                # expects fl2va weights specifically. Falls back to the main model input
+                # (already warned about above) only when model_fl2va isn't wired at all.
+                chunk_shifted_model = shifted_model_fl2va if shifted_model_fl2va is not None else shifted_model
             positive, latent = _unpack_node_result(out)[:2]
 
             noise = _unpack_node_result(_execute_comfy_node(RandomNoise, noise_seed=(seed + chunk_idx)))[0]
