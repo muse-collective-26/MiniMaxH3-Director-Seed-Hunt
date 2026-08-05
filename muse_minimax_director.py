@@ -435,15 +435,20 @@ def _build_character_subjects(tdata: dict):
     (its slot gets replaced by a continuity-anchor Picture on continuation chunks),
     so it isn't part of this function.
 
-    Returns (ref_images, subject_lines, retention_lines, subject_number_by_char_index).
+    Returns (ref_images, subject_lines, retention_meta, subject_number_by_char_index).
     subject_number_by_char_index maps a raw characters[] index -> its assigned
     <Subject N> number, used to resolve which subject a CUT's speakerCharIdx refers
-    to for (Sx) speaker tagging."""
+    to for (Sx) speaker tagging. retention_meta is (subject_n, picture_n, retention)
+    tuples rather than pre-formatted text — the per-chunk loop fills in an accurate
+    "(present throughout)" vs "(appears in [Shot N], ...)" presence clause once it
+    knows which shots each subject's tag actually appears in for that chunk (a
+    character introduced only from Shot 2 onward must not be asserted as present
+    throughout the whole chunk)."""
     characters = tdata.get("characters", [])[:MAX_CHARACTER_SLOTS]
 
     ref_images = {}
     subject_lines = []
-    retention_lines = []
+    retention_meta = []
     subject_number_by_char_index = {}
 
     for idx, ch in enumerate(characters):
@@ -463,10 +468,9 @@ def _build_character_subjects(tdata: dict):
         else:
             subject_lines.append(f"<Subject {subject_n}> is the subject shown in `<Picture {picture_n}>`.")
         retention = ch.get("retention") or "fully_preserved"
-        retention_lines.append(
-            f"<Subject {subject_n}> (present throughout): {retention} - matches `<Picture {picture_n}>`.")
+        retention_meta.append((subject_n, picture_n, retention))
 
-    return ref_images, subject_lines, retention_lines, subject_number_by_char_index
+    return ref_images, subject_lines, retention_meta, subject_number_by_char_index
 
 
 def _build_chunk_prompt(style_line: str, picture_labels: list, audio_labels: list,
@@ -531,6 +535,41 @@ def _wrap_dialogue(text: str, language: str) -> str:
         inner = _normalize_dialogue_text(m.group(1))
         return f"<d>[{language}] {inner}</d>"
     return _DIALOGUE_RE.sub(_sub, text)
+
+
+_SUBJECT_TAG_RE = re.compile(r'<Subject (\d+)>')
+
+
+def _find_subject_shot_appearances(chunk_segments: list) -> dict:
+    """Scans each non-empty CUT's own text for every literal <Subject N> tag the
+    user typed, recording which [Shot k] (1-indexed, matching detailed_description's
+    own numbering) each subject actually appears in for this chunk."""
+    appearances = {}
+    shot_num = 0
+    for seg in chunk_segments:
+        text = (seg.get("prompt") or "").strip()
+        if not text:
+            continue
+        shot_num += 1
+        for m in _SUBJECT_TAG_RE.finditer(text):
+            n = int(m.group(1))
+            shots = appearances.setdefault(n, [])
+            if shot_num not in shots:
+                shots.append(shot_num)
+    return appearances
+
+
+def _presence_phrase(subject_n: int, appearances: dict, total_shots: int) -> str:
+    """"(present throughout)" only when a subject's tag genuinely appears in every
+    shot of the chunk — otherwise the guide's own "(appears in [Shot N], ...)" format,
+    so a character introduced partway through (e.g. entering in Shot 2) isn't
+    misrepresented as present from the start."""
+    shots = appearances.get(subject_n, [])
+    if not shots:
+        return "(referenced in this shot)"
+    if total_shots > 0 and len(shots) >= total_shots:
+        return "(present throughout)"
+    return "(appears in " + ", ".join(f"[Shot {s}]" for s in shots) + ")"
 
 
 def _seg_speaker_indices(seg: dict) -> list:
@@ -728,7 +767,7 @@ class MuseMinimaxDirector:
                 seed, steps, sampler_name, scheduler, shift_video, shift_audio, timeline_data,
                 model_fl2va=None):
         tdata = _parse_timeline(timeline_data)
-        char_ref_images, subject_lines, subject_retention_lines, subject_number_by_char_index = _build_character_subjects(tdata)
+        char_ref_images, subject_lines, subject_retention_meta, subject_number_by_char_index = _build_character_subjects(tdata)
         subject_count = len(subject_lines)
         dialogue_language = (tdata.get("dialogue_language") or "English").strip() or "English"
         background = tdata.get("background")
@@ -868,8 +907,19 @@ class MuseMinimaxDirector:
                 # chunks and First/Last Frame mode route through MiniMaxH3ImageToVideo,
                 # which has no reference-tag system for the format to apply to.
                 chunk_subject_lines = list(subject_lines)
-                chunk_retention_lines = list(subject_retention_lines)
                 chunk_subject_tags = [f"<Subject {i + 1}>" for i in range(subject_count)]
+
+                # Which shot each <Subject N> tag actually appears in, for this chunk —
+                # used to write an accurate presence clause below instead of always
+                # claiming "(present throughout)" even for a character only introduced
+                # partway through (e.g. entering the scene in Shot 2).
+                subject_shot_appearances = _find_subject_shot_appearances(chunk_segments)
+                total_shots = sum(1 for s in chunk_segments if (s.get("prompt") or "").strip())
+                chunk_retention_lines = [
+                    f"<Subject {subject_n}> {_presence_phrase(subject_n, subject_shot_appearances, total_shots)}: "
+                    f"{retention} - matches `<Picture {picture_n}>`."
+                    for subject_n, picture_n, retention in subject_retention_meta
+                ]
                 # Audio entries are tracked in their own lists and appended after every
                 # visual Subject/Picture/Video line at assembly time — per MiniMax's own
                 # worked example, subject_definitions and retention_analysis always list
@@ -1036,8 +1086,9 @@ class MuseMinimaxDirector:
                         else:
                             chunk_subject_lines.append(f"<Subject {bg_subj_n}> is the setting shown in `<Picture {bg_picture_n}>`.")
                         bg_retention = background.get("retention") or "fully_preserved"
+                        bg_presence = _presence_phrase(bg_subj_n, subject_shot_appearances, total_shots)
                         chunk_retention_lines.append(
-                            f"<Subject {bg_subj_n}> (present throughout): {bg_retention} - matches `<Picture {bg_picture_n}>`.")
+                            f"<Subject {bg_subj_n}> {bg_presence}: {bg_retention} - matches `<Picture {bg_picture_n}>`.")
 
                 task_bits = ["reference generation"]
                 for t in ("video editing", "video continuation", "keyframe completion", "audio reuse", "audio reference"):
@@ -1047,10 +1098,12 @@ class MuseMinimaxDirector:
                     chunk_subject_tags, video_continuity_tag, carry_audio_tag)
 
                 shot_lines = []
-                for j, seg in enumerate(chunk_segments):
+                shot_idx = 0
+                for seg in chunk_segments:
                     text = (seg.get("prompt") or "").strip()
                     if not text:
                         continue
+                    shot_idx += 1
                     # speaker_assign was already computed in the pre-pass above — reused
                     # here, not rebuilt, so a paired audio's own subject_definitions line
                     # and this CUT's (Sx) tag always agree on the same speaker number.
@@ -1076,11 +1129,11 @@ class MuseMinimaxDirector:
                         if s_n:
                             text = f"<Subject {subj_n}> (S{s_n}) continues: {text}"
                     text = _wrap_dialogue(text, dialogue_language)
-                    if j == 0:
+                    if shot_idx == 1:
                         shot_lines.append(f"[Shot 1] {shot1_prefix}{text}")
                     else:
                         start_in_chunk = max(0.0, seg.get("_abs_start", 0.0) - chunk_start_sec)
-                        shot_lines.append(f"[Shot {j + 1}] At {_format_timestamp(start_in_chunk)}, {text}")
+                        shot_lines.append(f"[Shot {shot_idx}] At {_format_timestamp(start_in_chunk)}, {text}")
 
                 soundscape_text = (tdata.get("overall_soundscape") or "").strip()
                 music_text = (tdata.get("non_diegetic_music") or "").strip()
