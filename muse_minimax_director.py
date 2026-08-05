@@ -855,6 +855,13 @@ class MuseMinimaxDirector:
                 chunk_subject_lines = list(subject_lines)
                 chunk_retention_lines = list(subject_retention_lines)
                 chunk_subject_tags = [f"<Subject {i + 1}>" for i in range(subject_count)]
+                # Audio entries are tracked in their own lists and appended after every
+                # visual Subject/Picture/Video line at assembly time — per MiniMax's own
+                # worked example, subject_definitions and retention_analysis always list
+                # every <Subject N> first, then <Audio N> last, regardless of what order
+                # they happened to get built in below.
+                chunk_audio_subject_lines = []
+                chunk_audio_retention_lines = []
                 task_flags = set()
 
                 # Carry-over continuity always claims slot 0 of both ref_videos and
@@ -905,8 +912,8 @@ class MuseMinimaxDirector:
                     if paired_audio is not None:
                         chunk_ref_video_audios[f"ref_video_audio_{video_slot}"] = paired_audio
                         audio_tag_counter += 1
-                        chunk_subject_lines.append(f"<Audio {audio_tag_counter}> is the audio of `<Video {tag_n}>`.")
-                        chunk_retention_lines.append(
+                        chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is the audio of `<Video {tag_n}>`.")
+                        chunk_audio_retention_lines.append(
                             f"<Audio {audio_tag_counter}>: reference - guides voice timbre/delivery without "
                             "copying the original signal."
                         )
@@ -925,7 +932,8 @@ class MuseMinimaxDirector:
                     chunk_ref_audios[f"ref_audio_{audio_slot}"] = {"waveform": tail_wave, "sample_rate": tail_sr}
                     audio_tag_counter += 1
                     carry_audio_tag = f"<Audio {audio_tag_counter}>"
-                    chunk_retention_lines.append(
+                    chunk_audio_subject_lines.append(f"{carry_audio_tag} is the tail end of the previous shot's own score/ambience.")
+                    chunk_audio_retention_lines.append(
                         f"{carry_audio_tag} (previous shot's tail): partially_copy - the tail end of the "
                         "previous shot's own score/ambience continues into this one."
                     )
@@ -941,10 +949,10 @@ class MuseMinimaxDirector:
                     a_desc = (meta.get("description") or "").strip()
                     a_retention = meta.get("retention") or "reference"
                     if a_desc:
-                        chunk_subject_lines.append(f"<Audio {audio_tag_counter}> is the voice-timbre reference described as: {a_desc}.")
+                        chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is the voice-timbre reference described as: {a_desc}.")
                     else:
-                        chunk_subject_lines.append(f"<Audio {audio_tag_counter}> is a voice-timbre reference.")
-                    chunk_retention_lines.append(
+                        chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is a voice-timbre reference.")
+                    chunk_audio_retention_lines.append(
                         f"<Audio {audio_tag_counter}>: {a_retention} - "
                         + (a_desc if a_desc else "guides dialogue delivery without copying the original signal.")
                     )
@@ -1007,7 +1015,16 @@ class MuseMinimaxDirector:
                         subj_n = subject_number_by_char_index[speaker_idx]
                         if subj_n not in speaker_assign:
                             speaker_assign[subj_n] = len(speaker_assign) + 1
-                        text = text.replace(f"<Subject {subj_n}>", f"<Subject {subj_n}> (S{speaker_assign[subj_n]})")
+                        subj_tag = f"<Subject {subj_n}>"
+                        tagged = f"{subj_tag} (S{speaker_assign[subj_n]})"
+                        if subj_tag in text:
+                            text = text.replace(subj_tag, tagged)
+                        else:
+                            # CUT text doesn't mention the subject tag at all (e.g. a CUT
+                            # that's pure dialogue continuing a conversation) — without this,
+                            # picking a Speaker in the UI silently had no effect on the
+                            # compiled prompt, since there was nothing for it to attach to.
+                            text = f"{tagged} continues: {text}"
                     text = _wrap_dialogue(text, dialogue_language)
                     if j == 0:
                         shot_lines.append(f"[Shot 1] {shot1_prefix}{text}")
@@ -1021,8 +1038,12 @@ class MuseMinimaxDirector:
                     suffix = f"The copied ambience layer from `{carry_audio_tag}` continues throughout."
                     soundscape_text = (soundscape_text + " " + suffix) if soundscape_text else suffix
 
+                # Audio entries always come after every visual Subject/Picture/Video line —
+                # see the comment where chunk_audio_subject_lines/chunk_audio_retention_lines
+                # are initialized above.
                 chunk_prompt = _assemble_six_section_prompt(
-                    chunk_subject_lines, summary_line, chunk_retention_lines,
+                    chunk_subject_lines + chunk_audio_subject_lines, summary_line,
+                    chunk_retention_lines + chunk_audio_retention_lines,
                     style_line, shot_lines, soundscape_text, music_text,
                 )
 
