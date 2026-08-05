@@ -1,0 +1,13 @@
+[project]
+name = "muse-minimax-director"
+description = "Timeline-based director node for MiniMax H3 — visual CUT/segment editor, multi-character reference images, reference video + reference audio (with per-clip audio pairing for lipsync/voice reference), First/Last Frame mode, and automatic chunking with a hybrid hard-lock continuation option for videos longer than a single H3 generation."
+version = "1.0.0"
+license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/muse-collective-26/MiniMaxH3-Director"
+
+[tool.comfy]
+PublisherId = "muse-collective"
+DisplayName = "Muse Minimax Director"
+Icon = ""

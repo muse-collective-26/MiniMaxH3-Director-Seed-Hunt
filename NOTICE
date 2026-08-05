@@ -1,0 +1,21 @@
+MuseMinimaxDirector
+Copyright (c) 2026 Muse Collective
+
+This product includes an integration with MiniMax H3, a third-party
+open-weights omni-modal video generation model developed by MiniMax.
+MiniMax H3 is not included in this repository — it must be downloaded
+separately by the end user directly from its publisher.
+
+MiniMax H3 is licensed under the MiniMax H3 Community License Agreement,
+Copyright (c) MiniMax. All Rights Reserved.
+
+The full text of the MiniMax H3 Community License Agreement is available at:
+https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE
+
+Use of the MiniMax H3 model weights through this node is subject to that
+license, independently of the MIT license that covers the original code
+in this repository (see LICENSE). Users are responsible for reviewing and
+complying with the MiniMax H3 Community License Agreement themselves,
+including any territory or commercial-use restrictions it contains.
+
+Powered by MiniMax H3.
