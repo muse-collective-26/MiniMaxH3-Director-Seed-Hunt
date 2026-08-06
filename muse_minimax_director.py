@@ -520,32 +520,81 @@ def _build_character_subjects(tdata: dict, target_w: int, target_h: int, resize_
     return ref_images, subject_lines, retention_meta, subject_number_by_char_index
 
 
-def _build_chunk_prompt(style_line: str, picture_labels: list, audio_labels: list,
-                         continuity_notes: list, segments: list) -> str:
-    """Simple flat prompt builder — still used for First/Last Frame mode and for
-    Hybrid Continuation chunks. Neither has a reference-tag system at all
-    (MiniMaxH3ImageToVideo takes a bare prompt + first_frame/last_frame, not the
-    minimax_ref_items tokenizer path), so MiniMax's six-section reference-mode
-    format doesn't apply to them — only Reference (Omni) mode's own non-hybrid
-    chunks use the six-section builder below."""
-    parts = []
-    if style_line:
-        parts.append(style_line)
-    if picture_labels:
-        parts.append("Reference images: " + "; ".join(picture_labels) + ".")
-    if audio_labels:
-        parts.append("Reference audio: " + "; ".join(audio_labels) + ".")
-    if continuity_notes:
-        parts.extend(continuity_notes)
-    for i, seg in enumerate(segments):
+def _build_keyframe_alignment_line(has_first: bool, has_last: bool, last_shot_num: int, chunk_duration: float) -> str:
+    """Per MiniMax's own base-mode (T2VA/I2VA/FL2VA/L2VA) prompt guide: an opening
+    sentence describing how the <Picture N> keyframe(s) actually align with the
+    target video, exact phrasing per mode. T2VA (neither keyframe present) has no
+    such line at all — the guide says it "begins directly with core fields."
+    <Picture N> numbering here always follows the same order the real
+    MiniMaxH3ImageToVideo node appends images in (first_frame, then last_frame),
+    so this must be called with has_first/has_last reflecting that exact pairing,
+    not a fixed slot assumption — matches the same "dense fill order, not fixed
+    index" rule already used for every other tag-numbering path in this file."""
+    end_ts = _format_timestamp(chunk_duration)
+    if has_first and has_last:
+        return (
+            f"How the reference pictures align with the target video — `<Picture 1>` "
+            f"(from [Shot 1]) aligns with the 0.00-second mark; `<Picture 2>` "
+            f"(from [Shot {last_shot_num}]) aligns with the {end_ts} mark."
+        )
+    if has_first:
+        return (
+            f"For the target video, at 0.00 seconds into the target video, `<Picture 1>` "
+            f"(from [Shot 1]) is fully referenced."
+        )
+    if has_last:
+        return (
+            f"How the reference pictures align with the target video — `<Picture 1>` "
+            f"(from [Shot {last_shot_num}]) aligns with the {end_ts} mark."
+        )
+    return ""
+
+
+def _build_base_mode_shot_lines(chunk_segments: list, chunk_start_sec: float, dialogue_language: str) -> tuple:
+    """Shot lines for base mode's integrated_multimodal_description section. Base
+    mode has no <Subject N> abstraction at all (no reference-image/character
+    system — only the two keyframe images), so unlike Reference mode there's no
+    tag to attach a (Sx) speaker id to. Per the guide's own "assigned by vocal
+    event order" rule, (Sx) is instead numbered by first appearance among CUTs
+    with exactly one speaker selected, and appended directly after that CUT's own
+    wrapped dialogue. Returns (shot_lines, last_shot_num)."""
+    shot_lines = []
+    shot_idx = 0
+    speaker_assign = {}
+    for seg in chunk_segments:
         text = (seg.get("prompt") or "").strip()
         if not text:
             continue
-        cut_label = seg.get("label") or f"CUT {i + 1}"
-        weight = seg.get("duration_hint")
-        if weight:
-            cut_label += f" (~{weight}s)"
-        parts.append(f"{cut_label}: {text}")
+        shot_idx += 1
+        speaker_idxs = _seg_speaker_indices(seg)
+        s_n = None
+        if len(speaker_idxs) == 1:
+            char_idx = speaker_idxs[0]
+            s_n = speaker_assign.setdefault(char_idx, len(speaker_assign) + 1)
+        text = _wrap_dialogue(text, dialogue_language)
+        if s_n and "<d>" in text:
+            text = text.rstrip() + f" (S{s_n})"
+        if shot_idx == 1:
+            shot_lines.append(f"[Shot 1] {text}")
+        else:
+            start_in_chunk = max(0.0, seg.get("_abs_start", 0.0) - chunk_start_sec)
+            shot_lines.append(f"[Shot {shot_idx}] At {_format_timestamp(start_in_chunk)}, {text}")
+    return shot_lines, shot_idx
+
+
+def _assemble_base_mode_prompt(keyframe_line: str, style_line: str, shot_lines: list,
+                                soundscape_text: str, music_text: str) -> str:
+    """Assembles MiniMax's own three required sections for a single H3 base-mode
+    (T2VA/I2VA/FL2VA/L2VA) generation call: integrated_multimodal_description,
+    overall_soundscape, non_diegetic_music. keyframe_line is the guide's own
+    per-mode Picture-alignment opening sentence — empty for T2VA, which "begins
+    directly with core fields" per the guide, so no placeholder line is emitted."""
+    desc_lines = ([keyframe_line] if keyframe_line else []) + ([style_line] if style_line else []) + shot_lines
+    parts = []
+    if desc_lines:
+        parts.append("integrated_multimodal_description:\n" + "\n".join(desc_lines))
+    parts.append("overall_soundscape:\n" + (soundscape_text.strip() if soundscape_text else "N/A"))
+    parts.append("non_diegetic_music:\n" + (music_text.strip() if music_text else "N/A"))
     return "\n\n".join(parts)
 
 
@@ -981,17 +1030,22 @@ class MuseMinimaxDirector:
                 chunk_ref_videos = None
                 chunk_ref_audios = None
                 chunk_ref_images = {}
-                chunk_picture_labels = []
-                audio_labels = []
-                continuity_notes = []
                 # Only actually hybrid-switches once there's a predecessor chunk to lock
                 # onto — the first chunk always runs normal Reference (Omni), hybrid or not.
                 use_hybrid_chunk = use_hybrid and prev_chunk_images is not None
 
+                # Keyframe images for this chunk (base-mode dispatch only — mode !=
+                # MODE_REFERENCE or use_hybrid_chunk), in the exact order
+                # MiniMaxH3ImageToVideo itself appends them to its own images list
+                # (first_frame, then last_frame) — <Picture N> numbering in the
+                # base-mode prompt below must follow this same order to line up with
+                # what the node actually tokenizes.
+                base_continuity_extra = ""
+                base_soundscape_note = ""
                 if use_hybrid_chunk:
-                    continuity_notes.append(
-                        "This shot begins from the exact final frame of the previous shot, locked as the "
-                        "starting frame — continue the ongoing action naturally from this pose and framing, "
+                    chunk_first, chunk_last = prev_chunk_images[-1:], None
+                    base_continuity_extra = (
+                        " Continue the ongoing action naturally from this pose and framing — "
                         "no restart, no new take."
                     )
                     # Hybrid chunks have no reference audio at all (MiniMaxH3ImageToVideo takes none),
@@ -1006,14 +1060,25 @@ class MuseMinimaxDirector:
                         # example and H3 took that literally even in a standing-still shot with no
                         # walking at all) — defer entirely to whatever the shot description below
                         # actually says, rather than suggesting specific sounds that may not apply.
-                        continuity_notes.append(
-                            "This chunk has no reference audio to ground it — keep the soundscape ambient "
-                            "and grounded only in whatever is actually happening in the shot description "
-                            "below, consistent with the previous shot's environment. No invented sound "
-                            "effects or actions beyond what's described, and no dialogue or vocalization "
-                            "unless the shot description explicitly includes spoken lines."
+                        base_soundscape_note = (
+                            "No reference audio grounds this chunk — keep the soundscape ambient and "
+                            "grounded only in whatever is actually happening in the shot description, "
+                            "consistent with the previous shot's environment. No invented sound effects "
+                            "or actions beyond what's described, and no dialogue or vocalization unless "
+                            "the shot description explicitly includes spoken lines."
                         )
-                elif mode == MODE_REFERENCE:
+                elif mode != MODE_REFERENCE:
+                    chunk_first = prev_chunk_images[-1:] if prev_chunk_images is not None else first_frame
+                    chunk_last = last_frame if is_last_chunk else None
+                    if prev_chunk_images is not None:
+                        base_continuity_extra = (
+                            " Continue the ongoing action naturally from this pose and framing — "
+                            "no restart, no new take."
+                        )
+                else:
+                    chunk_first = chunk_last = None
+
+                if mode == MODE_REFERENCE and not use_hybrid_chunk:
                     # Non-hybrid Reference (Omni) chunks are the only case that gets
                     # MiniMax's own six-section reference-mode prompt format — hybrid
                     # chunks and First/Last Frame mode route through MiniMaxH3ImageToVideo,
@@ -1264,7 +1329,18 @@ class MuseMinimaxDirector:
                     )
 
                 if mode != MODE_REFERENCE or use_hybrid_chunk:
-                    chunk_prompt = _build_chunk_prompt(style_line, chunk_picture_labels, audio_labels, continuity_notes, chunk_segments)
+                    # Per MiniMax's own base-mode (T2VA/I2VA/FL2VA/L2VA) prompt guide —
+                    # no <Subject N> layer here, just the two keyframe images (if any)
+                    # tagged <Picture N> and a 3-section format, not the six-section
+                    # Reference-mode one above.
+                    base_shot_lines, base_last_shot = _build_base_mode_shot_lines(
+                        chunk_segments, chunk_start_sec, dialogue_language)
+                    keyframe_line = _build_keyframe_alignment_line(
+                        chunk_first is not None, chunk_last is not None, base_last_shot, chunk_len_seconds)
+                    if keyframe_line:
+                        keyframe_line += base_continuity_extra
+                    chunk_prompt = _assemble_base_mode_prompt(
+                        keyframe_line, style_line, base_shot_lines, base_soundscape_note, "")
                 compiled_prompts.append(f"--- Chunk {chunk_idx + 1}/{num_chunks} (~{chunk_len_seconds:.1f}s) ---\n{chunk_prompt}")
 
                 log.info("[MuseMinimaxDirector] chunk %d/%d, seed=%d, length=%d frames, video_carry=%s, audio_carry=%s, hybrid=%s",
@@ -1276,7 +1352,7 @@ class MuseMinimaxDirector:
                         MiniMaxH3ImageToVideo,
                         clip=clip, vae=vae, prompt=chunk_prompt,
                         width=width, height=height, length=chunk_length,
-                        first_frame=prev_chunk_images[-1:], last_frame=None,
+                        first_frame=chunk_first, last_frame=chunk_last,
                     )
                     chunk_shifted_model = shifted_model_fl2va
                 elif mode == MODE_REFERENCE:
@@ -1291,8 +1367,6 @@ class MuseMinimaxDirector:
                     )
                     chunk_shifted_model = shifted_model
                 else:
-                    chunk_first = prev_chunk_images[-1:] if prev_chunk_images is not None else first_frame
-                    chunk_last = last_frame if is_last_chunk else None
                     out = _execute_comfy_node(
                         MiniMaxH3ImageToVideo,
                         clip=clip, vae=vae, prompt=chunk_prompt,
