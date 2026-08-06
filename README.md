@@ -121,7 +121,7 @@ You will also need a matching CLIP text encoder, a video VAE, and an audio VAE �
 
 ## Example workflow
 
-A ready-to-load workflow is included at [`workflows/muse_minimax_h3_director.json`](workflows/muse_minimax_h3_director.json) — model loaders wired up, sigma-shift patches applied, and `MuseMinimaxDirector` connected straight through to a Video Combine node. Reference slots are left empty on purpose so you drop in your own characters and location rather than inheriting someone else's.
+A ready-to-load workflow is included at [`workflows/muse_minimax_h3_director_scout_v1.json`](workflows/muse_minimax_h3_director_scout_v1.json) — the full Seed Hunt scouting pipeline: model loaders wired up, sigma-shift patches applied, `MuseMinimaxDirector` with `seed_hunt` on, all 4 candidates previewed through their own Video Combine nodes, and two [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine) nodes wired up (one candidate-driven, one taking the plain `images`/`audio` output for a single non-scouted run) feeding a final high-resolution output. Reference slots are left empty on purpose so you drop in your own characters and location rather than inheriting someone else's.
 
 It also uses a few extra nodes purely for convenience/performance, on top of what's required above — search ComfyUI Manager for these if they show as missing when you load it:
 
@@ -129,6 +129,8 @@ It also uses a few extra nodes purely for convenience/performance, on top of wha
 - **ComfyUI-LayerStyle** (`LayerUtility: PurgeVRAM`) — clears VRAM between preview steps, not required for generation to work
 - A text-preview node (`iToolsPreviewText`) showing the `compiled_prompt` output — swap for any other STRING preview node (e.g. "Show Text" from ComfyUI-Custom-Scripts) if you don't have this one
 - A SageAttention memory-efficiency patch (`MiniMaxH3MemoryEfficientSageAttentionPatch`) applied to the model — optional; the node still runs without it, just less memory-efficient
+- **ComfyUI-Nvidia-RTX-Nodes** (`RTXVideoSuperResolution`) — an additional generic upscaler on some of the candidate preview branches, on top of/instead of Muse Minimax Refine's own img2img-style refine; entirely optional, disabled branches (`mode: 4`) by default in the saved workflow
+- **[ComfyUI-Spectrum-MiniMax-H3](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3)** (`SpectrumApplyMiniMaxH3`) — a third-party speed optimization that forecasts some sampling steps instead of running the full transformer on them, wired into the model chain at its conservative default preset. **Worth knowing**: its own docs state forecasted steps change the denoising trajectory, so outputs can differ from a fully native run even with an identical seed — if you're doing careful seed-to-seed comparison (which is the whole point of Seed Hunt), consider disabling this node so what you're comparing is genuine seed variation, not forecasting variance
 
 None of these are needed for `MuseMinimaxDirector` itself to work — only for this specific example graph exactly as saved.
 
