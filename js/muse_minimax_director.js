@@ -26,7 +26,7 @@ const HIDDEN_WIDGET_NAMES = ["timeline_data"];
 const BOXED_WIDGET_NAMES = [
   "mode", "duration_seconds", "chunk_duration_seconds",
   "aspect_ratio", "megapixels", "multiple", "resize_method",
-  "steps", "sampler_name", "scheduler", "seed", "control_after_generate", "shift_video", "shift_audio",
+  "steps", "sampler_name", "scheduler", "seed", "seed_hunt", "control_after_generate", "shift_video", "shift_audio",
   "ref_image_size", "hybrid_continuation",
 ];
 // "seed" uses a text input below (see _seedRow), not the generic number row — avoids
@@ -632,6 +632,7 @@ class MinimaxTimelineEditor {
     if (this.realWidgets.steps) box.appendChild(this._numberRow("Steps", this.realWidgets.steps));
     if (this.realWidgets.seed) box.appendChild(this._seedRow(this.realWidgets.seed));
     if (this.realWidgets.control_after_generate) box.appendChild(this._selectRow("After Generate", this.realWidgets.control_after_generate));
+    if (this.realWidgets.seed_hunt) box.appendChild(this._boolRow("Seed Hunt (4 passes)", this.realWidgets.seed_hunt));
     if (this.realWidgets.shift_video) box.appendChild(this._numberRow("Shift (video)", this.realWidgets.shift_video));
     if (this.realWidgets.shift_audio) box.appendChild(this._numberRow("Shift (audio)", this.realWidgets.shift_audio));
 
@@ -815,6 +816,24 @@ class MinimaxTimelineEditor {
       this.node.setDirtyCanvas(true, true);
     });
     rowEl.appendChild(input);
+
+    // ComfyUI's native "control_after_generate" (fixed/increment/decrement/randomize)
+    // mutates widget.value directly right after each queued prompt, to preview the
+    // next run's seed — it does NOT go through widget.callback. Since this row only
+    // read widget.value once at build time, that mutation was invisible here and the
+    // displayed number went stale after the first randomize. Re-defining the property
+    // with our own accessor catches every future write, from any source, and mirrors
+    // it into the input live.
+    let currentValue = widget.value;
+    Object.defineProperty(widget, "value", {
+      configurable: true,
+      get: () => currentValue,
+      set: (v) => {
+        currentValue = v;
+        if (document.activeElement !== input) input.value = String(v);
+      },
+    });
+
     return rowEl;
   }
 

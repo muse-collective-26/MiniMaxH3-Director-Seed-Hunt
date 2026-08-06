@@ -1,8 +1,10 @@
-# Muse Minimax Director
+# Muse Minimax Director (Seed Hunt)
 
-**Timeline-based director node for MiniMax H3 in ComfyUI**
+**Timeline-based director node for MiniMax H3 in ComfyUI, with Seed Hunt scouting**
 
 Built by [Muse Collective](https://musecollective.co.uk) — write a single flowing script broken into CUTs, drop in reference character images/video/audio, and let the node handle chunking, prompt-per-chunk splitting, and reference-tag numbering for you.
+
+This is a fork of [Muse Minimax Director](https://github.com/muse-collective-26/MiniMaxH3-Director) that adds a **Seed Hunt** toggle — scout 4 candidate seeds in one run at low resolution, then pick the best one and refine it at full resolution with the companion [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine) node. The original repo stays as the simpler, single-generation version; this one is for anyone who wants the scouting workflow built in.
 
 ![ComfyUI Custom Node](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange?style=flat-square)
 ![MiniMax H3](https://img.shields.io/badge/MiniMax-H3-blue?style=flat-square)
@@ -40,6 +42,10 @@ MiniMax H3 is a strong omni-modal model, but its native inputs are low-level: nu
 - **Reference video audio** — a per-clip toggle to also pull that reference video's own embedded audio out and use it as a separate voice/timbre reference — useful for lipsync-style "reperformance," where the same spoken words come out in a different, reference-specified voice
 - **Reference audio** — standalone voice cloning / timbre reference, independent of any video, for direct dialogue-in-a-cloned-voice generation
 - **Correct `<Picture N>` / `<Video N>` / `<Audio N>` tag numbering** — built to match MiniMax H3's actual assignment rule, which is iteration order over the reference dictionary's values, **not** the numeric suffix of the input slot's own key. Reference items always land in the compiled prompt with the same tag numbers H3 itself will actually assign them
+- **MiniMax's full six-section reference-mode prompt format** — `subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`, `<Subject N>` abstraction layer, fixed-vocabulary retention markers, `[Shot N] At MM:SS.mmm` shot timestamps, and `(Sx)` speaker tags — built automatically from the timeline UI, per MiniMax's own official prompt-writing guide
+- **Multi-speaker CUTs** — pick one or more speaking characters per CUT via chips in the timeline UI; quoted dialogue gets auto-attributed and `(Sx)`-tagged against the right `<Subject N>`, with positional Ref Audio ↔ Ref character voice pairing
+- **Seed Hunt** — an optional toggle that runs the whole timeline 4 times at identical settings, seed only, and outputs all 4 as separate candidate image/audio pairs (see [Seed Hunt, in detail](#seed-hunt-in-detail) below)
+- **`ref_images_used` output** — the exact reference photos used for `<Picture N>` tagging on this run, ready to wire into [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine)'s own `ref_images` input for identity-locked second-pass refining
 - **Sigma shift controls** exposed directly on the node, applied via the real `MiniMaxH3SigmaShift` node
 - **Image + audio output**, not a bundled video file — wire straight into a standard Video Combine node alongside the rest of your pipeline
 - **`compiled_prompt` output** — the exact, fully-resolved prompt text sent to H3 for every chunk, so you can see precisely what tags and continuity language the node generated
@@ -77,7 +83,7 @@ Search for **Muse Minimax Director** and click Install.
 ### Manual
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/muse-collective-26/MiniMaxH3-Director
+git clone https://github.com/muse-collective-26/MiniMaxH3-Director-Seed-Hunt
 ```
 
 Restart ComfyUI after installing.
@@ -148,7 +154,8 @@ None of these are needed for `MuseMinimaxDirector` itself to work — only for t
 | `chunk_duration_seconds` | FLOAT | Target length per chunk when chunking is needed |
 | `ref_image_size` | Combo | Resolution reference images are resized to before being sent to H3 |
 | `hybrid_continuation` | BOOLEAN | Reference mode only. When on (and `model_fl2va` is connected), chunk boundaries are hard-locked via the First/Last Frame checkpoint instead of soft carry-over conditioning |
-| `seed` | INT | Sampler seed |
+| `seed` | INT | Sampler seed for the main run (also the base seed for Seed Hunt's 4 candidates) |
+| `seed_hunt` | BOOLEAN | When on, runs the whole timeline 4 times — identical settings, only the seed differs — and fills `candidate_1..4_images/audio`. Takes ~4x as long as a single run; see [Seed Hunt, in detail](#seed-hunt-in-detail) |
 | `steps` | INT | Sampler steps |
 | `sampler_name` | Combo | Sampler algorithm |
 | `scheduler` | Combo | Noise scheduler |
@@ -160,9 +167,14 @@ None of these are needed for `MuseMinimaxDirector` itself to work — only for t
 
 | Output | Type | Description |
 |--------|------|--------------|
-| `images` | IMAGE | Generated video frames — wire into a Video Combine node |
-| `audio` | AUDIO | Generated/mixed audio track — wire into the same Video Combine node |
-| `compiled_prompt` | STRING | The exact per-chunk prompt(s) actually sent to H3, including every resolved `<Picture N>` / `<Video N>` / `<Audio N>` label and any auto-generated continuity language. The single best debugging tool for this node — if a render doesn't look right, check this first |
+| `images` | IMAGE | Generated video frames for the main run. **Blocked (not populated) when `seed_hunt` is on** — Seed Hunt is a scouting run, not a final one, so this only ever means "the one real generation" with Seed Hunt off. Use `candidate_1..4` instead when scouting |
+| `audio` | AUDIO | Generated/mixed audio track, same blocking behavior as `images` |
+| `compiled_prompt` | STRING | The exact per-chunk prompt(s) actually sent to H3, including every resolved section, tag, and continuity language. The single best debugging tool for this node — if a render doesn't look right, check this first. Populated regardless of `seed_hunt` |
+| `ref_images_used` | IMAGE | The static `<Picture N>` reference image set actually used on this run's first chunk (character/product photos + background, in H3's own tag order). Reference mode only — empty in First/Last Frame mode. Wire into [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine)'s `ref_images` input for identity-locked refining. Populated regardless of `seed_hunt` |
+| `candidate_1_images` / `candidate_1_audio` | IMAGE / AUDIO | Always mirrors `images`/`audio` (the main run), at zero extra cost — populated whether or not `seed_hunt` is on |
+| `candidate_2..4_images` / `candidate_2..4_audio` | IMAGE / AUDIO | The 3 additional scouting passes (seed + N×1,000,003). Only populated when `seed_hunt` is on — empty otherwise |
+
+`images`/`audio` being blocked with `seed_hunt` on, and `candidate_2..4` being empty with it off, both use ComfyUI's `ExecutionBlocker` — anything wired to an unpopulated output stops silently (a console warning, no red error, no interruption to the rest of the queue) rather than running on the wrong data.
 
 ---
 
@@ -180,18 +192,33 @@ Switching `mode` to **First/Last Frame** repurposes the first two character slot
 
 ## Reference mode, in detail
 
-Reference mode uses H3's `MiniMaxH3ReferenceToVideo` checkpoint and its `<Picture N>` / `<Video N>` / `<Audio N>` tag system. This is the mode for character-consistent generation across a full script, and for anything that needs more than one reference source at once.
+Reference mode uses H3's `MiniMaxH3ReferenceToVideo` checkpoint and MiniMax's own full **six-section prompt format** (`subject_definitions` / `summary` / `retention_analysis` / `detailed_description` / `overall_soundscape` / `non_diegetic_music`), per their official prompt-writing guide. This is the mode for character-consistent generation across a full script, and for anything that needs more than one reference source at once — the node assembles all six sections for you from the timeline UI.
 
-**Example — a simple character-reference prompt** (Ref 1 filled with a photo of a woman with a ponytail, Location filled with a boardwalk photo):
+**Example** (Ref 1 filled with a photo of a woman with a ponytail, Location filled with a boardwalk photo):
 
 ```
-`<Picture 1>` = a woman with a dark ponytail, wearing a cream trench coat
-`<Picture 2>` = the setting (a wooden boardwalk beside the sea at golden hour)
+subject_definitions:
+<Subject 1> is a woman with a dark ponytail, wearing a cream trench coat (from `<Picture 1>`).
+<Subject 2> is the setting, a wooden boardwalk beside the sea at golden hour (from `<Picture 2>`).
 
-CUT 1: The woman from `<Picture 1>` walks slowly along the boardwalk from `<Picture 2>`, wind moving through her coat, warm low sun behind her.
+summary:
+[reference generation] <Subject 1> walks along the boardwalk in <Subject 2>.
+
+retention_analysis:
+<Subject 1> (present throughout): fully_preserved - matches `<Picture 1>`.
+<Subject 2> (present throughout): fully_preserved - matches `<Picture 2>`.
+
+detailed_description:
+[Shot 1] <Subject 1> walks slowly along the boardwalk in <Subject 2>, wind moving through her coat, warm low sun behind her.
+
+overall_soundscape:
+Gentle waves, distant gulls, a light breeze.
+
+non_diegetic_music:
+Soft, warm acoustic guitar, understated.
 ```
 
-This label/tag scaffolding is built automatically from your Characters and Location slots and their description fields — you only need to write the CUT text itself.
+This scaffolding is built automatically from your Characters, Location, and CUT text — you only need to write the CUT prompt itself, plus optional per-slot descriptions/retention and the two global Soundscape/Music fields in Reference Settings.
 
 ---
 
@@ -267,6 +294,27 @@ Available only in Reference mode, and only with a First/Last-Frame checkpoint wi
 This trades away some of Reference mode's character-reference reinforcement on the affected chunks (since the First/Last-Frame checkpoint has no `<Picture N>` tag system to keep reinforcing identity from your original reference images) in exchange for eliminating the visible hard-cut seam at chunk boundaries. In practice this trade is often worth it, since the locked anchor frame itself already carries the correct identity forward from whichever chunk was generated in full Reference mode.
 
 The first chunk of a render is always generated in full Reference mode regardless of this toggle, since there is no previous chunk to continue from yet.
+
+---
+
+## Multi-speaker CUTs, in detail
+
+Each CUT can have one or more speaking characters selected via chips in the timeline UI. Quoted dialogue in a CUT's text gets `(Sx)` speaker tags auto-attached to the right `<Subject N>` occurrences, with `(Sx)` numbers assigned in order of first appearance within the chunk. Standalone reference audio clips pair positionally with character slots (Ref Audio N ↔ Ref N) for voice-timbre reference, cited against the correct `(Sx)` automatically. With exactly one speaker selected on a CUT, untagged dialogue is auto-attributed to them; with two or more selected, tag the `<Subject N>` you mean directly in the CUT text — there's no safe way to guess which speaker owns an untagged line once more than one is selected.
+
+---
+
+## Seed Hunt, in detail
+
+MiniMax H3 generation is expensive enough that finding out a render didn't follow the prompt, after paying full price for it, is a real cost. Seed Hunt runs the entire timeline **4 times** — identical prompt, identical settings, only the seed differs (`seed`, `seed + 1,000,003`, `seed + 2,000,006`, `seed + 3,000,009`) — and outputs all 4 as separate `candidate_1..4_images`/`candidate_1..4_audio` pairs, so you can generate cheaply (low `megapixels`), compare all 4, and only spend real compute refining the one that actually worked.
+
+With `seed_hunt` off (the default), only `candidate_1` is populated (mirroring the main `images`/`audio` output, at no extra cost) and the main `images`/`audio` outputs work exactly as they do without this toggle at all.
+
+With `seed_hunt` on:
+- The main `images`/`audio` outputs are **intentionally blocked** — they don't mean "a picked result" during scouting, only during a normal single run, so nothing downstream can mistake an unpicked scout for a finished video.
+- All 4 `candidate_N` pairs are populated.
+- Expect roughly 4x the render time of a single run.
+
+**Recommended workflow**: set `megapixels` low for the Seed Hunt run (cheap, fast scouting), wire `candidate_1..4_images`/`audio` and `ref_images_used` into [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine), pick the candidate that actually matches the prompt via its button selector, and let Refine do the expensive, high-resolution second pass on just that one.
 
 ---
 

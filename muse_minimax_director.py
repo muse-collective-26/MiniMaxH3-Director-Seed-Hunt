@@ -77,6 +77,7 @@ from comfy_extras.nodes_minimax_h3 import (
     MiniMaxH3ReferenceToVideo, MiniMaxH3ImageToVideo, MiniMaxH3SigmaShift, align_frame_count,
 )
 from comfy_extras.nodes_resolution import AspectRatio, ASPECT_RATIOS
+from comfy_execution.graph import ExecutionBlocker
 
 log = logging.getLogger(__name__)
 
@@ -231,6 +232,9 @@ MODE_FIRST_LAST = "First/Last Frame — zero, one, or two frame images"
 
 MAX_CHARACTER_SLOTS = 9
 ASPECT_RATIO_OPTIONS = [a.value for a in AspectRatio]
+# Spacing between Seed Hunt's 4 candidate passes' base seeds — large enough to never
+# collide with the small per-chunk `+chunk_idx` offset already applied inside a pass.
+SEED_HUNT_SEED_STRIDE = 1_000_003
 
 
 def _execute_comfy_node(node_class, **kwargs):
@@ -792,6 +796,12 @@ class MuseMinimaxDirector:
                     "carries the correct likeness forward, since it's real output from the reference-anchored "
                     "first chunk, not a blank start)."}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "seed_hunt": ("BOOLEAN", {"default": False, "tooltip":
+                    "When on, runs 4 full passes total — identical settings, only the seed differs — and "
+                    "fills the candidate_1..4 outputs (candidate_1 is always the main seed; 2-4 use seed + "
+                    "N*1,000,003). Wire candidate_1..4_images/audio into MuseMinimaxRefine to pick one and "
+                    "refine it at higher resolution. Takes ~4x as long as a single run — set megapixels low "
+                    "here for cheap scouting, then refine at full resolution downstream."}),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 100}),
                 "sampler_name": (["res_multistep", "euler", "euler_ancestral", "dpmpp_2m"], {"default": "res_multistep"}),
                 "scheduler": (["simple", "normal", "beta", "sgm_uniform"], {"default": "simple"}),
@@ -813,14 +823,17 @@ class MuseMinimaxDirector:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "STRING")
-    RETURN_NAMES = ("images", "audio", "compiled_prompt")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "STRING", "IMAGE",
+                     "IMAGE", "AUDIO", "IMAGE", "AUDIO", "IMAGE", "AUDIO", "IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio", "compiled_prompt", "ref_images_used",
+                     "candidate_1_images", "candidate_1_audio", "candidate_2_images", "candidate_2_audio",
+                     "candidate_3_images", "candidate_3_audio", "candidate_4_images", "candidate_4_audio")
     FUNCTION = "execute"
     CATEGORY = "Muse Collective"
 
     def execute(self, mode, model, clip, vae, audio_vae, aspect_ratio, megapixels, multiple, resize_method,
                 duration_seconds, chunk_duration_seconds, ref_image_size, hybrid_continuation,
-                seed, steps, sampler_name, scheduler, shift_video, shift_audio, timeline_data,
+                seed, seed_hunt, steps, sampler_name, scheduler, shift_video, shift_audio, timeline_data,
                 model_fl2va=None):
         tdata = _parse_timeline(timeline_data)
         # Resolved before any reference image is loaded — every character/background/
@@ -853,12 +866,32 @@ class MuseMinimaxDirector:
         bg_index = len(char_ref_images)
         style_line = (tdata.get("style_line") or "").strip()
 
+        # Static reference-image set actually used for <Picture N> tagging on this run's
+        # first chunk (character/product photos + background, same dense fill order
+        # MiniMaxH3ReferenceToVideo assigns Picture numbers by) — exposed as a real output
+        # so MuseMinimaxRefine can reuse the exact same reference photos for identity/prop
+        # lock during its own refine pass, instead of the user re-uploading them via
+        # separate LoadImage nodes. Only meaningful in Reference (Omni) mode — First/Last
+        # Frame mode has no <Picture N> tagging at all. Matches chunk 1's own composition
+        # specifically (see the `elif background and (...)` branch below) since Refine only
+        # ever operates on a single H3-call-length candidate, never a later continuation chunk.
+        ref_images_used_list = []
+        if mode == MODE_REFERENCE:
+            ref_images_used_list.extend(char_ref_images.values())
+            if background and (background.get("file") or background.get("image_b64")):
+                bg_tensor = _load_character_image(background)
+                if bg_tensor is not None:
+                    bg_tensor = _fit_image_to_target(bg_tensor, width, height, resize_method)
+                    ref_images_used_list.append(bg_tensor)
+        ref_images_used = torch.cat(ref_images_used_list, dim=0) if ref_images_used_list else torch.zeros((0, height, width, 3))
+
         buckets, chunk_lengths, chunk_bounds = _bucket_segments_into_chunks(tdata, duration_seconds, chunk_duration_seconds)
         num_chunks = len(buckets)
 
         log.info(
-            "[MuseMinimaxDirector] mode=%s, %dx%d, %d chunk(s): %s (total %.1fs)",
-            mode, width, height, num_chunks, ", ".join(f"~{c:.1f}s" for c in chunk_lengths), duration_seconds,
+            "[MuseMinimaxDirector] mode=%s, %dx%d, seed=%d, seed_hunt=%s, %d chunk(s): %s (total %.1fs)",
+            mode, width, height, seed, seed_hunt, num_chunks,
+            ", ".join(f"~{c:.1f}s" for c in chunk_lengths), duration_seconds,
         )
 
         from nodes import NODE_CLASS_MAPPINGS
@@ -925,373 +958,431 @@ class MuseMinimaxDirector:
             if clip_audio is not None:
                 user_ref_audios.append((clip_audio, entry, ui_idx))
 
-        all_images = []
-        all_waveform = None
-        audio_sample_rate = None
-        compiled_prompts = []
-        prev_chunk_images = None
-        prev_chunk_audio = None
+        # The entire per-chunk build + sample + decode pipeline below only ever
+        # depends on `seed` in one place (RandomNoise's noise_seed) — everything
+        # else (prompts, reference assembly, conditioning) is identical regardless
+        # of seed. Wrapped as a nested function so Seed Hunt can call it multiple
+        # times with different seeds, and the single-pass (non-hunt) path is just
+        # calling it once — same code, no duplicated logic between the two.
+        def _run_pass(pass_seed):
+            all_images = []
+            all_waveform = None
+            audio_sample_rate = None
+            compiled_prompts = []
+            prev_chunk_images = None
+            prev_chunk_audio = None
 
-        for chunk_idx, chunk_segments in enumerate(buckets):
-            chunk_len_seconds = chunk_lengths[chunk_idx]
-            chunk_length = align_frame_count(max(5, round(chunk_len_seconds * 24)))
-            is_last_chunk = chunk_idx == num_chunks - 1
-            chunk_start_sec = chunk_bounds[chunk_idx][0]
+            for chunk_idx, chunk_segments in enumerate(buckets):
+                chunk_len_seconds = chunk_lengths[chunk_idx]
+                chunk_length = align_frame_count(max(5, round(chunk_len_seconds * 24)))
+                is_last_chunk = chunk_idx == num_chunks - 1
+                chunk_start_sec = chunk_bounds[chunk_idx][0]
 
-            chunk_ref_videos = None
-            chunk_ref_audios = None
-            chunk_ref_images = {}
-            chunk_picture_labels = []
-            audio_labels = []
-            continuity_notes = []
-            # Only actually hybrid-switches once there's a predecessor chunk to lock
-            # onto — the first chunk always runs normal Reference (Omni), hybrid or not.
-            use_hybrid_chunk = use_hybrid and prev_chunk_images is not None
+                chunk_ref_videos = None
+                chunk_ref_audios = None
+                chunk_ref_images = {}
+                chunk_picture_labels = []
+                audio_labels = []
+                continuity_notes = []
+                # Only actually hybrid-switches once there's a predecessor chunk to lock
+                # onto — the first chunk always runs normal Reference (Omni), hybrid or not.
+                use_hybrid_chunk = use_hybrid and prev_chunk_images is not None
 
-            if use_hybrid_chunk:
-                continuity_notes.append(
-                    "This shot begins from the exact final frame of the previous shot, locked as the "
-                    "starting frame — continue the ongoing action naturally from this pose and framing, "
-                    "no restart, no new take."
-                )
-                # Hybrid chunks have no reference audio at all (MiniMaxH3ImageToVideo takes none),
-                # so without any audio grounding H3 tends to hallucinate unprompted vocalization/
-                # speech (confirmed via spectrogram on a real test render). Only suppress that when
-                # this chunk's own CUT text doesn't actually call for dialogue — quoted text is the
-                # existing convention for spoken lines, so a quote mark means the user wants speech
-                # here and this note must not fight that.
-                has_dialogue = any('"' in (seg.get("prompt") or "") for seg in chunk_segments)
-                if not has_dialogue:
-                    # No hardcoded example sounds here (an earlier version listed "footsteps" as an
-                    # example and H3 took that literally even in a standing-still shot with no
-                    # walking at all) — defer entirely to whatever the shot description below
-                    # actually says, rather than suggesting specific sounds that may not apply.
+                if use_hybrid_chunk:
                     continuity_notes.append(
-                        "This chunk has no reference audio to ground it — keep the soundscape ambient "
-                        "and grounded only in whatever is actually happening in the shot description "
-                        "below, consistent with the previous shot's environment. No invented sound "
-                        "effects or actions beyond what's described, and no dialogue or vocalization "
-                        "unless the shot description explicitly includes spoken lines."
+                        "This shot begins from the exact final frame of the previous shot, locked as the "
+                        "starting frame — continue the ongoing action naturally from this pose and framing, "
+                        "no restart, no new take."
                     )
-            elif mode == MODE_REFERENCE:
-                # Non-hybrid Reference (Omni) chunks are the only case that gets
-                # MiniMax's own six-section reference-mode prompt format — hybrid
-                # chunks and First/Last Frame mode route through MiniMaxH3ImageToVideo,
-                # which has no reference-tag system for the format to apply to.
-                chunk_subject_lines = list(subject_lines)
-                chunk_subject_tags = [f"<Subject {i + 1}>" for i in range(subject_count)]
-
-                # Which shot each <Subject N> tag actually appears in, for this chunk —
-                # used to write an accurate presence clause below instead of always
-                # claiming "(present throughout)" even for a character only introduced
-                # partway through (e.g. entering the scene in Shot 2).
-                subject_shot_appearances = _find_subject_shot_appearances(chunk_segments)
-                total_shots = sum(1 for s in chunk_segments if (s.get("prompt") or "").strip())
-                chunk_retention_lines = [
-                    f"<Subject {subject_n}> {_presence_phrase(subject_n, subject_shot_appearances, total_shots)}: "
-                    f"{retention} - matches `<Picture {picture_n}>`."
-                    for subject_n, picture_n, retention in subject_retention_meta
-                ]
-                # Audio entries are tracked in their own lists and appended after every
-                # visual Subject/Picture/Video line at assembly time — per MiniMax's own
-                # worked example, subject_definitions and retention_analysis always list
-                # every <Subject N> first, then <Audio N> last, regardless of what order
-                # they happened to get built in below.
-                chunk_audio_subject_lines = []
-                chunk_audio_retention_lines = []
-                task_flags = set()
-
-                # Speaker IDs are assigned in one pre-pass over every CUT in this chunk,
-                # before subject_definitions gets built — a paired ref_audio's own
-                # definition line needs to already know its character's (Sx) number
-                # (per the guide's own pattern: "<Audio 1> is the voice-timbre reference
-                # for <Subject 3> (S1)"), and that requires knowing every speaking
-                # character's assignment up front rather than discovering it only once
-                # detailed_description is built afterwards.
-                speaker_assign = {}
-                for seg in chunk_segments:
-                    if not (seg.get("prompt") or "").strip():
-                        continue
-                    for char_idx in _seg_speaker_indices(seg):
-                        if char_idx in subject_number_by_char_index:
-                            subj_n = subject_number_by_char_index[char_idx]
-                            if subj_n not in speaker_assign:
-                                speaker_assign[subj_n] = len(speaker_assign) + 1
-
-                # Carry-over continuity always claims slot 0 of both ref_videos and
-                # ref_audios once a chunk has a predecessor — H3 allows 3 of each, so
-                # user-provided references fill whatever slots are left after that.
-                chunk_ref_videos = {}
-                chunk_ref_video_audios = {}
-                video_slot = 0
-                video_continuity_tag = None
-                # <Audio j> numbering: a reference video's own paired soundtrack gets tagged
-                # before any standalone ref_audios (interleaved right before its <Video k> tag)
-                # — confirmed from the real node's own ref_items build order — so this counter
-                # has to run across both loops below, video-paired audio first.
-                audio_tag_counter = 0
-                if prev_chunk_images is not None:
-                    chunk_ref_videos[f"ref_video_{video_slot}"] = prev_chunk_images
-                    video_continuity_tag = f"<Video {video_slot + 1}>"
-                    chunk_retention_lines.append(
-                        f"{video_continuity_tag} (continuation source): fully_preserved - continues directly "
-                        "from the immediately preceding shot's final moment, same action and camera framing."
-                    )
-                    task_flags.add("video continuation")
-                    video_slot += 1
-                for v, paired_audio, meta in user_ref_videos:
-                    if video_slot > 2:
-                        log.warning("[MuseMinimaxDirector] ref_video slots full (3 max, one reserved for chunk "
-                                    "carry-over) — dropping an extra user-provided reference video.")
-                        break
-                    tag_n = video_slot + 1
-                    chunk_ref_videos[f"ref_video_{video_slot}"] = v
-                    role = meta.get("role") or "reference"
-                    if role == "editing_source":
-                        task_flags.add("video editing")
-                    elif role == "continuation_source":
-                        task_flags.add("video continuation")
-                    v_desc = (meta.get("description") or "").strip()
-                    v_retention = meta.get("retention") or ("fully_preserved" if v_desc else "weak_reference")
-                    if v_desc:
-                        subj_n = len(chunk_subject_tags) + 1
-                        chunk_subject_tags.append(f"<Subject {subj_n}>")
-                        chunk_subject_lines.append(f"<Subject {subj_n}> is {v_desc} (from `<Video {tag_n}>`).")
-                        chunk_retention_lines.append(f"<Subject {subj_n}> (from `<Video {tag_n}>`): {v_retention} - {v_desc}.")
-                    else:
-                        chunk_retention_lines.append(
-                            f"`<Video {tag_n}>` (camera/motion reference): {v_retention} - only structural/camera "
-                            "characteristics are retained; no visible content is reused."
+                    # Hybrid chunks have no reference audio at all (MiniMaxH3ImageToVideo takes none),
+                    # so without any audio grounding H3 tends to hallucinate unprompted vocalization/
+                    # speech (confirmed via spectrogram on a real test render). Only suppress that when
+                    # this chunk's own CUT text doesn't actually call for dialogue — quoted text is the
+                    # existing convention for spoken lines, so a quote mark means the user wants speech
+                    # here and this note must not fight that.
+                    has_dialogue = any('"' in (seg.get("prompt") or "") for seg in chunk_segments)
+                    if not has_dialogue:
+                        # No hardcoded example sounds here (an earlier version listed "footsteps" as an
+                        # example and H3 took that literally even in a standing-still shot with no
+                        # walking at all) — defer entirely to whatever the shot description below
+                        # actually says, rather than suggesting specific sounds that may not apply.
+                        continuity_notes.append(
+                            "This chunk has no reference audio to ground it — keep the soundscape ambient "
+                            "and grounded only in whatever is actually happening in the shot description "
+                            "below, consistent with the previous shot's environment. No invented sound "
+                            "effects or actions beyond what's described, and no dialogue or vocalization "
+                            "unless the shot description explicitly includes spoken lines."
                         )
-                    if paired_audio is not None:
-                        chunk_ref_video_audios[f"ref_video_audio_{video_slot}"] = paired_audio
-                        audio_tag_counter += 1
-                        chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is the audio of `<Video {tag_n}>`.")
-                        chunk_audio_retention_lines.append(
-                            f"<Audio {audio_tag_counter}>: reference - guides voice timbre/delivery without "
-                            "copying the original signal."
-                        )
-                        task_flags.add("audio reference")
-                    video_slot += 1
+                elif mode == MODE_REFERENCE:
+                    # Non-hybrid Reference (Omni) chunks are the only case that gets
+                    # MiniMax's own six-section reference-mode prompt format — hybrid
+                    # chunks and First/Last Frame mode route through MiniMaxH3ImageToVideo,
+                    # which has no reference-tag system for the format to apply to.
+                    chunk_subject_lines = list(subject_lines)
+                    chunk_subject_tags = [f"<Subject {i + 1}>" for i in range(subject_count)]
 
-                chunk_ref_audios = {}
-                audio_slot = 0
-                carry_audio_tag = None
-                if prev_chunk_audio is not None:
-                    # Tail of the previous chunk's own decoded audio, not the whole thing —
-                    # H3 treats every ref_audio as a short (2-15s) reference clip.
-                    tail_sr = prev_chunk_audio["sample_rate"]
-                    tail_samples = min(prev_chunk_audio["waveform"].shape[-1], int(4.0 * tail_sr))
-                    tail_wave = prev_chunk_audio["waveform"][..., -tail_samples:]
-                    chunk_ref_audios[f"ref_audio_{audio_slot}"] = {"waveform": tail_wave, "sample_rate": tail_sr}
-                    audio_tag_counter += 1
-                    carry_audio_tag = f"<Audio {audio_tag_counter}>"
-                    chunk_audio_subject_lines.append(f"{carry_audio_tag} is the tail end of the previous shot's own score/ambience.")
-                    chunk_audio_retention_lines.append(
-                        f"{carry_audio_tag} (previous shot's tail): partially_copy - the tail end of the "
-                        "previous shot's own score/ambience continues into this one."
-                    )
-                    task_flags.add("audio reuse")
-                    audio_slot += 1
-                for clip_audio, meta, ui_idx in user_ref_audios:
-                    if audio_slot > 2:
-                        log.warning("[MuseMinimaxDirector] ref_audio slots full (3 max, one reserved for chunk "
-                                    "carry-over once a chunk has a predecessor) — dropping an extra reference audio clip.")
-                        break
-                    chunk_ref_audios[f"ref_audio_{audio_slot}"] = clip_audio
-                    audio_tag_counter += 1
-                    a_desc = (meta.get("description") or "").strip()
-                    a_retention = meta.get("retention") or "reference"
-                    # Positional pairing: Ref Audio N is always Ref (character) N's
-                    # voice, by array index — matches the guide's own preferred phrasing
-                    # ("<Audio N> is the voice-timbre reference for <Subject M> (Sx)")
-                    # instead of a generic, unlinked description.
-                    paired_subj_n = subject_number_by_char_index.get(ui_idx)
-                    if paired_subj_n is not None:
-                        sx = speaker_assign.get(paired_subj_n)
-                        sx_suffix = f" (S{sx})" if sx else ""
-                        chunk_audio_subject_lines.append(
-                            f"<Audio {audio_tag_counter}> is the voice-timbre reference for `<Subject {paired_subj_n}>`{sx_suffix}.")
-                    elif a_desc:
-                        chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is the voice-timbre reference described as: {a_desc}.")
-                    else:
-                        chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is a voice-timbre reference.")
-                    chunk_audio_retention_lines.append(
-                        f"<Audio {audio_tag_counter}>: {a_retention} - "
-                        + (a_desc if a_desc else "guides dialogue delivery without copying the original signal.")
-                    )
-                    task_flags.add("audio reuse" if a_retention in ("fully_copy", "partially_copy") else "audio reference")
-                    audio_slot += 1
+                    # Which shot each <Subject N> tag actually appears in, for this chunk —
+                    # used to write an accurate presence clause below instead of always
+                    # claiming "(present throughout)" even for a character only introduced
+                    # partway through (e.g. entering the scene in Shot 2).
+                    subject_shot_appearances = _find_subject_shot_appearances(chunk_segments)
+                    total_shots = sum(1 for s in chunk_segments if (s.get("prompt") or "").strip())
+                    chunk_retention_lines = [
+                        f"<Subject {subject_n}> {_presence_phrase(subject_n, subject_shot_appearances, total_shots)}: "
+                        f"{retention} - matches `<Picture {picture_n}>`."
+                        for subject_n, picture_n, retention in subject_retention_meta
+                    ]
+                    # Audio entries are tracked in their own lists and appended after every
+                    # visual Subject/Picture/Video line at assembly time — per MiniMax's own
+                    # worked example, subject_definitions and retention_analysis always list
+                    # every <Subject N> first, then <Audio N> last, regardless of what order
+                    # they happened to get built in below.
+                    chunk_audio_subject_lines = []
+                    chunk_audio_retention_lines = []
+                    task_flags = set()
 
-                # Reference images: characters are always present; the fixed background
-                # slot holds either the real background image (first chunk / no
-                # predecessor, wrapped as its own <Subject N> the same way characters
-                # are) or, on continuation chunks, the previous chunk's own last frame
-                # as a standalone <Picture N> keyframe anchor — per the guide's own
-                # carve-out, a genuine first/last/keyframe anchor gets a standalone
-                # Picture entry rather than being wrapped as a Subject.
-                chunk_ref_images = dict(char_ref_images)
-                shot1_prefix = ""
-                if prev_chunk_images is not None:
-                    last_frame_still = prev_chunk_images[-1:]
-                    chunk_ref_images[f"ref_image_{bg_index}"] = last_frame_still
-                    anchor_n = bg_index + 1
-                    chunk_retention_lines.append(
-                        f"`<Picture {anchor_n}>` ([Shot 1] first-frame anchor): fully_preserved - the exact "
-                        "framing, pose, and camera angle at the end of the previous shot."
-                    )
-                    task_flags.add("keyframe completion")
-                    shot1_prefix = (
-                        f"The shot begins from `<Picture {anchor_n}>`, continuing directly from the previous "
-                        "shot's exact framing and pose. "
-                    )
-                elif background and (background.get("file") or background.get("image_b64")):
-                    tensor = _load_character_image(background)
-                    if tensor is not None:
-                        tensor = _fit_image_to_target(tensor, width, height, resize_method)
-                        chunk_ref_images[f"ref_image_{bg_index}"] = tensor
-                        bg_picture_n = bg_index + 1
-                        bg_subj_n = len(chunk_subject_tags) + 1
-                        chunk_subject_tags.append(f"<Subject {bg_subj_n}>")
-                        bg_desc = (background.get("description") or "").strip()
-                        if bg_desc:
-                            chunk_subject_lines.append(f"<Subject {bg_subj_n}> is {bg_desc} (from `<Picture {bg_picture_n}>`).")
-                        else:
-                            chunk_subject_lines.append(f"<Subject {bg_subj_n}> is the setting shown in `<Picture {bg_picture_n}>`.")
-                        bg_retention = background.get("retention") or "fully_preserved"
-                        bg_presence = _presence_phrase(bg_subj_n, subject_shot_appearances, total_shots)
-                        chunk_retention_lines.append(
-                            f"<Subject {bg_subj_n}> {bg_presence}: {bg_retention} - matches `<Picture {bg_picture_n}>`.")
-
-                task_bits = ["reference generation"]
-                for t in ("video editing", "video continuation", "keyframe completion", "audio reuse", "audio reference"):
-                    if t in task_flags:
-                        task_bits.append(t)
-                summary_line = f"[{' + '.join(task_bits)}] " + _build_summary_sentence(
-                    chunk_subject_tags, video_continuity_tag, carry_audio_tag)
-
-                shot_lines = []
-                shot_idx = 0
-                for seg in chunk_segments:
-                    text = (seg.get("prompt") or "").strip()
-                    if not text:
-                        continue
-                    shot_idx += 1
-                    # speaker_assign was already computed in the pre-pass above — reused
-                    # here, not rebuilt, so a paired audio's own subject_definitions line
-                    # and this CUT's (Sx) tag always agree on the same speaker number.
-                    speaker_idxs = _seg_speaker_indices(seg)
-                    tagged_any = False
-                    for char_idx in speaker_idxs:
-                        subj_n = subject_number_by_char_index.get(char_idx)
-                        s_n = speaker_assign.get(subj_n) if subj_n is not None else None
-                        if not s_n:
+                    # Speaker IDs are assigned in one pre-pass over every CUT in this chunk,
+                    # before subject_definitions gets built — a paired ref_audio's own
+                    # definition line needs to already know its character's (Sx) number
+                    # (per the guide's own pattern: "<Audio 1> is the voice-timbre reference
+                    # for <Subject 3> (S1)"), and that requires knowing every speaking
+                    # character's assignment up front rather than discovering it only once
+                    # detailed_description is built afterwards.
+                    speaker_assign = {}
+                    for seg in chunk_segments:
+                        if not (seg.get("prompt") or "").strip():
                             continue
-                        subj_tag = f"<Subject {subj_n}>"
-                        if subj_tag in text:
-                            text = text.replace(subj_tag, f"{subj_tag} (S{s_n})")
-                            tagged_any = True
-                    # Only auto-attribute an untagged line when this CUT has exactly one
-                    # speaker selected — with two or more, there's no safe way to guess
-                    # which one owns dialogue that doesn't mention either tag, so leave
-                    # it for the user to tag explicitly (e.g. type <Subject 2> themselves)
-                    # rather than risk attributing someone else's line to the wrong voice.
-                    if not tagged_any and len(speaker_idxs) == 1:
-                        subj_n = subject_number_by_char_index.get(speaker_idxs[0])
-                        s_n = speaker_assign.get(subj_n) if subj_n is not None else None
-                        if s_n:
-                            text = f"<Subject {subj_n}> (S{s_n}) continues: {text}"
-                    text = _wrap_dialogue(text, dialogue_language)
-                    if shot_idx == 1:
-                        shot_lines.append(f"[Shot 1] {shot1_prefix}{text}")
-                    else:
-                        start_in_chunk = max(0.0, seg.get("_abs_start", 0.0) - chunk_start_sec)
-                        shot_lines.append(f"[Shot {shot_idx}] At {_format_timestamp(start_in_chunk)}, {text}")
+                        for char_idx in _seg_speaker_indices(seg):
+                            if char_idx in subject_number_by_char_index:
+                                subj_n = subject_number_by_char_index[char_idx]
+                                if subj_n not in speaker_assign:
+                                    speaker_assign[subj_n] = len(speaker_assign) + 1
 
-                soundscape_text = (tdata.get("overall_soundscape") or "").strip()
-                music_text = (tdata.get("non_diegetic_music") or "").strip()
-                if carry_audio_tag:
-                    suffix = f"The copied ambience layer from `{carry_audio_tag}` continues throughout."
-                    soundscape_text = (soundscape_text + " " + suffix) if soundscape_text else suffix
+                    # Carry-over continuity always claims slot 0 of both ref_videos and
+                    # ref_audios once a chunk has a predecessor — H3 allows 3 of each, so
+                    # user-provided references fill whatever slots are left after that.
+                    chunk_ref_videos = {}
+                    chunk_ref_video_audios = {}
+                    video_slot = 0
+                    video_continuity_tag = None
+                    # <Audio j> numbering: a reference video's own paired soundtrack gets tagged
+                    # before any standalone ref_audios (interleaved right before its <Video k> tag)
+                    # — confirmed from the real node's own ref_items build order — so this counter
+                    # has to run across both loops below, video-paired audio first.
+                    audio_tag_counter = 0
+                    if prev_chunk_images is not None:
+                        chunk_ref_videos[f"ref_video_{video_slot}"] = prev_chunk_images
+                        video_continuity_tag = f"<Video {video_slot + 1}>"
+                        chunk_retention_lines.append(
+                            f"{video_continuity_tag} (continuation source): fully_preserved - continues directly "
+                            "from the immediately preceding shot's final moment, same action and camera framing."
+                        )
+                        task_flags.add("video continuation")
+                        video_slot += 1
+                    for v, paired_audio, meta in user_ref_videos:
+                        if video_slot > 2:
+                            log.warning("[MuseMinimaxDirector] ref_video slots full (3 max, one reserved for chunk "
+                                        "carry-over) — dropping an extra user-provided reference video.")
+                            break
+                        tag_n = video_slot + 1
+                        chunk_ref_videos[f"ref_video_{video_slot}"] = v
+                        role = meta.get("role") or "reference"
+                        if role == "editing_source":
+                            task_flags.add("video editing")
+                        elif role == "continuation_source":
+                            task_flags.add("video continuation")
+                        v_desc = (meta.get("description") or "").strip()
+                        v_retention = meta.get("retention") or ("fully_preserved" if v_desc else "weak_reference")
+                        if v_desc:
+                            subj_n = len(chunk_subject_tags) + 1
+                            chunk_subject_tags.append(f"<Subject {subj_n}>")
+                            chunk_subject_lines.append(f"<Subject {subj_n}> is {v_desc} (from `<Video {tag_n}>`).")
+                            chunk_retention_lines.append(f"<Subject {subj_n}> (from `<Video {tag_n}>`): {v_retention} - {v_desc}.")
+                        else:
+                            chunk_retention_lines.append(
+                                f"`<Video {tag_n}>` (camera/motion reference): {v_retention} - only structural/camera "
+                                "characteristics are retained; no visible content is reused."
+                            )
+                        if paired_audio is not None:
+                            chunk_ref_video_audios[f"ref_video_audio_{video_slot}"] = paired_audio
+                            audio_tag_counter += 1
+                            chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is the audio of `<Video {tag_n}>`.")
+                            chunk_audio_retention_lines.append(
+                                f"<Audio {audio_tag_counter}>: reference - guides voice timbre/delivery without "
+                                "copying the original signal."
+                            )
+                            task_flags.add("audio reference")
+                        video_slot += 1
 
-                # Audio entries always come after every visual Subject/Picture/Video line —
-                # see the comment where chunk_audio_subject_lines/chunk_audio_retention_lines
-                # are initialized above.
-                chunk_prompt = _assemble_six_section_prompt(
-                    chunk_subject_lines + chunk_audio_subject_lines, summary_line,
-                    chunk_retention_lines + chunk_audio_retention_lines,
-                    style_line, shot_lines, soundscape_text, music_text,
-                )
+                    chunk_ref_audios = {}
+                    audio_slot = 0
+                    carry_audio_tag = None
+                    if prev_chunk_audio is not None:
+                        # Tail of the previous chunk's own decoded audio, not the whole thing —
+                        # H3 treats every ref_audio as a short (2-15s) reference clip.
+                        tail_sr = prev_chunk_audio["sample_rate"]
+                        tail_samples = min(prev_chunk_audio["waveform"].shape[-1], int(4.0 * tail_sr))
+                        tail_wave = prev_chunk_audio["waveform"][..., -tail_samples:]
+                        chunk_ref_audios[f"ref_audio_{audio_slot}"] = {"waveform": tail_wave, "sample_rate": tail_sr}
+                        audio_tag_counter += 1
+                        carry_audio_tag = f"<Audio {audio_tag_counter}>"
+                        chunk_audio_subject_lines.append(f"{carry_audio_tag} is the tail end of the previous shot's own score/ambience.")
+                        chunk_audio_retention_lines.append(
+                            f"{carry_audio_tag} (previous shot's tail): partially_copy - the tail end of the "
+                            "previous shot's own score/ambience continues into this one."
+                        )
+                        task_flags.add("audio reuse")
+                        audio_slot += 1
+                    for clip_audio, meta, ui_idx in user_ref_audios:
+                        if audio_slot > 2:
+                            log.warning("[MuseMinimaxDirector] ref_audio slots full (3 max, one reserved for chunk "
+                                        "carry-over once a chunk has a predecessor) — dropping an extra reference audio clip.")
+                            break
+                        chunk_ref_audios[f"ref_audio_{audio_slot}"] = clip_audio
+                        audio_tag_counter += 1
+                        a_desc = (meta.get("description") or "").strip()
+                        a_retention = meta.get("retention") or "reference"
+                        # Positional pairing: Ref Audio N is always Ref (character) N's
+                        # voice, by array index — matches the guide's own preferred phrasing
+                        # ("<Audio N> is the voice-timbre reference for <Subject M> (Sx)")
+                        # instead of a generic, unlinked description.
+                        paired_subj_n = subject_number_by_char_index.get(ui_idx)
+                        if paired_subj_n is not None:
+                            sx = speaker_assign.get(paired_subj_n)
+                            sx_suffix = f" (S{sx})" if sx else ""
+                            chunk_audio_subject_lines.append(
+                                f"<Audio {audio_tag_counter}> is the voice-timbre reference for `<Subject {paired_subj_n}>`{sx_suffix}.")
+                        elif a_desc:
+                            chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is the voice-timbre reference described as: {a_desc}.")
+                        else:
+                            chunk_audio_subject_lines.append(f"<Audio {audio_tag_counter}> is a voice-timbre reference.")
+                        chunk_audio_retention_lines.append(
+                            f"<Audio {audio_tag_counter}>: {a_retention} - "
+                            + (a_desc if a_desc else "guides dialogue delivery without copying the original signal.")
+                        )
+                        task_flags.add("audio reuse" if a_retention in ("fully_copy", "partially_copy") else "audio reference")
+                        audio_slot += 1
 
-            if mode != MODE_REFERENCE or use_hybrid_chunk:
-                chunk_prompt = _build_chunk_prompt(style_line, chunk_picture_labels, audio_labels, continuity_notes, chunk_segments)
-            compiled_prompts.append(f"--- Chunk {chunk_idx + 1}/{num_chunks} (~{chunk_len_seconds:.1f}s) ---\n{chunk_prompt}")
+                    # Reference images: characters are always present; the fixed background
+                    # slot holds either the real background image (first chunk / no
+                    # predecessor, wrapped as its own <Subject N> the same way characters
+                    # are) or, on continuation chunks, the previous chunk's own last frame
+                    # as a standalone <Picture N> keyframe anchor — per the guide's own
+                    # carve-out, a genuine first/last/keyframe anchor gets a standalone
+                    # Picture entry rather than being wrapped as a Subject.
+                    chunk_ref_images = dict(char_ref_images)
+                    shot1_prefix = ""
+                    if prev_chunk_images is not None:
+                        last_frame_still = prev_chunk_images[-1:]
+                        chunk_ref_images[f"ref_image_{bg_index}"] = last_frame_still
+                        anchor_n = bg_index + 1
+                        chunk_retention_lines.append(
+                            f"`<Picture {anchor_n}>` ([Shot 1] first-frame anchor): fully_preserved - the exact "
+                            "framing, pose, and camera angle at the end of the previous shot."
+                        )
+                        task_flags.add("keyframe completion")
+                        shot1_prefix = (
+                            f"The shot begins from `<Picture {anchor_n}>`, continuing directly from the previous "
+                            "shot's exact framing and pose. "
+                        )
+                    elif background and (background.get("file") or background.get("image_b64")):
+                        tensor = _load_character_image(background)
+                        if tensor is not None:
+                            tensor = _fit_image_to_target(tensor, width, height, resize_method)
+                            chunk_ref_images[f"ref_image_{bg_index}"] = tensor
+                            bg_picture_n = bg_index + 1
+                            bg_subj_n = len(chunk_subject_tags) + 1
+                            chunk_subject_tags.append(f"<Subject {bg_subj_n}>")
+                            bg_desc = (background.get("description") or "").strip()
+                            if bg_desc:
+                                chunk_subject_lines.append(f"<Subject {bg_subj_n}> is {bg_desc} (from `<Picture {bg_picture_n}>`).")
+                            else:
+                                chunk_subject_lines.append(f"<Subject {bg_subj_n}> is the setting shown in `<Picture {bg_picture_n}>`.")
+                            bg_retention = background.get("retention") or "fully_preserved"
+                            bg_presence = _presence_phrase(bg_subj_n, subject_shot_appearances, total_shots)
+                            chunk_retention_lines.append(
+                                f"<Subject {bg_subj_n}> {bg_presence}: {bg_retention} - matches `<Picture {bg_picture_n}>`.")
 
-            log.info("[MuseMinimaxDirector] chunk %d/%d, length=%d frames, video_carry=%s, audio_carry=%s, hybrid=%s",
-                      chunk_idx + 1, num_chunks, chunk_length, prev_chunk_images is not None,
-                      prev_chunk_audio is not None, use_hybrid_chunk)
+                    task_bits = ["reference generation"]
+                    for t in ("video editing", "video continuation", "keyframe completion", "audio reuse", "audio reference"):
+                        if t in task_flags:
+                            task_bits.append(t)
+                    summary_line = f"[{' + '.join(task_bits)}] " + _build_summary_sentence(
+                        chunk_subject_tags, video_continuity_tag, carry_audio_tag)
 
-            if use_hybrid_chunk:
-                out = _execute_comfy_node(
-                    MiniMaxH3ImageToVideo,
-                    clip=clip, vae=vae, prompt=chunk_prompt,
-                    width=width, height=height, length=chunk_length,
-                    first_frame=prev_chunk_images[-1:], last_frame=None,
-                )
-                chunk_shifted_model = shifted_model_fl2va
-            elif mode == MODE_REFERENCE:
-                out = _execute_comfy_node(
-                    MiniMaxH3ReferenceToVideo,
-                    clip=clip, vae=vae, audio_vae=audio_vae, prompt=chunk_prompt,
-                    width=width, height=height, length=chunk_length, ref_image_size=ref_image_size,
-                    ref_images=chunk_ref_images if chunk_ref_images else None,
-                    ref_videos=chunk_ref_videos if chunk_ref_videos else None,
-                    ref_video_audios=chunk_ref_video_audios if chunk_ref_video_audios else None,
-                    ref_audios=chunk_ref_audios if chunk_ref_audios else None,
-                )
-                chunk_shifted_model = shifted_model
-            else:
-                chunk_first = prev_chunk_images[-1:] if prev_chunk_images is not None else first_frame
-                chunk_last = last_frame if is_last_chunk else None
-                out = _execute_comfy_node(
-                    MiniMaxH3ImageToVideo,
-                    clip=clip, vae=vae, prompt=chunk_prompt,
-                    width=width, height=height, length=chunk_length,
-                    first_frame=chunk_first, last_frame=chunk_last,
-                )
-                # Prefer the real fl2va checkpoint when connected — MiniMaxH3ImageToVideo
-                # expects fl2va weights specifically. Falls back to the main model input
-                # (already warned about above) only when model_fl2va isn't wired at all.
-                chunk_shifted_model = shifted_model_fl2va if shifted_model_fl2va is not None else shifted_model
-            positive, latent = _unpack_node_result(out)[:2]
+                    shot_lines = []
+                    shot_idx = 0
+                    for seg in chunk_segments:
+                        text = (seg.get("prompt") or "").strip()
+                        if not text:
+                            continue
+                        shot_idx += 1
+                        # speaker_assign was already computed in the pre-pass above — reused
+                        # here, not rebuilt, so a paired audio's own subject_definitions line
+                        # and this CUT's (Sx) tag always agree on the same speaker number.
+                        speaker_idxs = _seg_speaker_indices(seg)
+                        tagged_any = False
+                        for char_idx in speaker_idxs:
+                            subj_n = subject_number_by_char_index.get(char_idx)
+                            s_n = speaker_assign.get(subj_n) if subj_n is not None else None
+                            if not s_n:
+                                continue
+                            subj_tag = f"<Subject {subj_n}>"
+                            if subj_tag in text:
+                                text = text.replace(subj_tag, f"{subj_tag} (S{s_n})")
+                                tagged_any = True
+                        # Only auto-attribute an untagged line when this CUT has exactly one
+                        # speaker selected — with two or more, there's no safe way to guess
+                        # which one owns dialogue that doesn't mention either tag, so leave
+                        # it for the user to tag explicitly (e.g. type <Subject 2> themselves)
+                        # rather than risk attributing someone else's line to the wrong voice.
+                        if not tagged_any and len(speaker_idxs) == 1:
+                            subj_n = subject_number_by_char_index.get(speaker_idxs[0])
+                            s_n = speaker_assign.get(subj_n) if subj_n is not None else None
+                            if s_n:
+                                text = f"<Subject {subj_n}> (S{s_n}) continues: {text}"
+                        text = _wrap_dialogue(text, dialogue_language)
+                        if shot_idx == 1:
+                            shot_lines.append(f"[Shot 1] {shot1_prefix}{text}")
+                        else:
+                            start_in_chunk = max(0.0, seg.get("_abs_start", 0.0) - chunk_start_sec)
+                            shot_lines.append(f"[Shot {shot_idx}] At {_format_timestamp(start_in_chunk)}, {text}")
 
-            noise = _unpack_node_result(_execute_comfy_node(RandomNoise, noise_seed=(seed + chunk_idx)))[0]
-            guider = _unpack_node_result(_execute_comfy_node(BasicGuider, model=chunk_shifted_model, conditioning=positive))[0]
-            sigmas = _unpack_node_result(_execute_comfy_node(
-                BasicScheduler, model=chunk_shifted_model, scheduler=scheduler, steps=steps, denoise=1.0,
-            ))[0]
-            sampled = _unpack_node_result(_execute_comfy_node(
-                SamplerCustomAdvanced, noise=noise, guider=guider, sampler=sampler, sigmas=sigmas, latent_image=latent,
-            ))[0]
+                    soundscape_text = (tdata.get("overall_soundscape") or "").strip()
+                    music_text = (tdata.get("non_diegetic_music") or "").strip()
+                    if carry_audio_tag:
+                        suffix = f"The copied ambience layer from `{carry_audio_tag}` continues throughout."
+                        soundscape_text = (soundscape_text + " " + suffix) if soundscape_text else suffix
 
-            chunk_images = _unpack_node_result(_execute_comfy_node(VAEDecode, samples=sampled, vae=vae))[0]
-            chunk_audio = _unpack_node_result(_execute_comfy_node(VAEDecodeAudio, samples=sampled, vae=audio_vae))[0]
+                    # Audio entries always come after every visual Subject/Picture/Video line —
+                    # see the comment where chunk_audio_subject_lines/chunk_audio_retention_lines
+                    # are initialized above.
+                    chunk_prompt = _assemble_six_section_prompt(
+                        chunk_subject_lines + chunk_audio_subject_lines, summary_line,
+                        chunk_retention_lines + chunk_audio_retention_lines,
+                        style_line, shot_lines, soundscape_text, music_text,
+                    )
 
-            all_images.append(chunk_images)
-            waveform = chunk_audio["waveform"]
-            if all_waveform is None:
-                all_waveform = waveform
-                audio_sample_rate = chunk_audio["sample_rate"]
-            else:
-                all_waveform = torch.cat([all_waveform, waveform], dim=-1)
+                if mode != MODE_REFERENCE or use_hybrid_chunk:
+                    chunk_prompt = _build_chunk_prompt(style_line, chunk_picture_labels, audio_labels, continuity_notes, chunk_segments)
+                compiled_prompts.append(f"--- Chunk {chunk_idx + 1}/{num_chunks} (~{chunk_len_seconds:.1f}s) ---\n{chunk_prompt}")
 
-            prev_chunk_images = chunk_images
-            prev_chunk_audio = chunk_audio
+                log.info("[MuseMinimaxDirector] chunk %d/%d, seed=%d, length=%d frames, video_carry=%s, audio_carry=%s, hybrid=%s",
+                          chunk_idx + 1, num_chunks, pass_seed + chunk_idx, chunk_length, prev_chunk_images is not None,
+                          prev_chunk_audio is not None, use_hybrid_chunk)
 
-        final_images = torch.cat(all_images, dim=0) if len(all_images) > 1 else all_images[0]
-        final_audio = {"waveform": all_waveform, "sample_rate": audio_sample_rate}
+                if use_hybrid_chunk:
+                    out = _execute_comfy_node(
+                        MiniMaxH3ImageToVideo,
+                        clip=clip, vae=vae, prompt=chunk_prompt,
+                        width=width, height=height, length=chunk_length,
+                        first_frame=prev_chunk_images[-1:], last_frame=None,
+                    )
+                    chunk_shifted_model = shifted_model_fl2va
+                elif mode == MODE_REFERENCE:
+                    out = _execute_comfy_node(
+                        MiniMaxH3ReferenceToVideo,
+                        clip=clip, vae=vae, audio_vae=audio_vae, prompt=chunk_prompt,
+                        width=width, height=height, length=chunk_length, ref_image_size=ref_image_size,
+                        ref_images=chunk_ref_images if chunk_ref_images else None,
+                        ref_videos=chunk_ref_videos if chunk_ref_videos else None,
+                        ref_video_audios=chunk_ref_video_audios if chunk_ref_video_audios else None,
+                        ref_audios=chunk_ref_audios if chunk_ref_audios else None,
+                    )
+                    chunk_shifted_model = shifted_model
+                else:
+                    chunk_first = prev_chunk_images[-1:] if prev_chunk_images is not None else first_frame
+                    chunk_last = last_frame if is_last_chunk else None
+                    out = _execute_comfy_node(
+                        MiniMaxH3ImageToVideo,
+                        clip=clip, vae=vae, prompt=chunk_prompt,
+                        width=width, height=height, length=chunk_length,
+                        first_frame=chunk_first, last_frame=chunk_last,
+                    )
+                    # Prefer the real fl2va checkpoint when connected — MiniMaxH3ImageToVideo
+                    # expects fl2va weights specifically. Falls back to the main model input
+                    # (already warned about above) only when model_fl2va isn't wired at all.
+                    chunk_shifted_model = shifted_model_fl2va if shifted_model_fl2va is not None else shifted_model
+                positive, latent = _unpack_node_result(out)[:2]
 
-        return (final_images, final_audio, "\n\n".join(compiled_prompts))
+                noise = _unpack_node_result(_execute_comfy_node(RandomNoise, noise_seed=(pass_seed + chunk_idx)))[0]
+                guider = _unpack_node_result(_execute_comfy_node(BasicGuider, model=chunk_shifted_model, conditioning=positive))[0]
+                sigmas = _unpack_node_result(_execute_comfy_node(
+                    BasicScheduler, model=chunk_shifted_model, scheduler=scheduler, steps=steps, denoise=1.0,
+                ))[0]
+                sampled = _unpack_node_result(_execute_comfy_node(
+                    SamplerCustomAdvanced, noise=noise, guider=guider, sampler=sampler, sigmas=sigmas, latent_image=latent,
+                ))[0]
+
+                chunk_images = _unpack_node_result(_execute_comfy_node(VAEDecode, samples=sampled, vae=vae))[0]
+                chunk_audio = _unpack_node_result(_execute_comfy_node(VAEDecodeAudio, samples=sampled, vae=audio_vae))[0]
+
+                all_images.append(chunk_images)
+                waveform = chunk_audio["waveform"]
+                if all_waveform is None:
+                    all_waveform = waveform
+                    audio_sample_rate = chunk_audio["sample_rate"]
+                else:
+                    all_waveform = torch.cat([all_waveform, waveform], dim=-1)
+
+                prev_chunk_images = chunk_images
+                prev_chunk_audio = chunk_audio
+
+            final_images = torch.cat(all_images, dim=0) if len(all_images) > 1 else all_images[0]
+            final_audio = {"waveform": all_waveform, "sample_rate": audio_sample_rate}
+
+            return final_images, final_audio, "\n\n".join(compiled_prompts)
+
+        images, audio, compiled_prompt_text = _run_pass(seed)
+        # candidate_1 always mirrors the main single-pass result, at zero extra cost —
+        # so "just refine my one result" keeps working with Seed Hunt left off, exactly
+        # like it already does today. candidates 2-4 are the extra scouting passes,
+        # only computed (3 more full runs, same settings, different seed) when Seed
+        # Hunt is actually on.
+        candidate_images = [images, None, None, None]
+        candidate_audio = [audio, None, None, None]
+
+        if seed_hunt:
+            log.warning("[MuseMinimaxDirector] Seed Hunt is on — running 3 additional full passes "
+                        "(4 total) at identical settings, different seeds only. Takes ~4x as long as "
+                        "a single run.")
+            for i in range(1, 4):
+                pass_seed = seed + i * SEED_HUNT_SEED_STRIDE
+                c_images, c_audio, _ = _run_pass(pass_seed)
+                candidate_images[i] = c_images
+                candidate_audio[i] = c_audio
+
+        empty_images = torch.zeros((0, height, width, 3))
+        empty_audio = {"waveform": torch.zeros((1, 1, 0)), "sample_rate": 44100}
+
+        # Seed Hunt is a scouting run, not a final one — main images/audio only ever
+        # mean "the one real generation" when Seed Hunt is off. With it on, leaving
+        # them silently equal to candidate_1 invites wiring something downstream
+        # straight to what looks like a finished result when it's really just one of
+        # four unpicked scouts. Blocked (not populated with candidate_1) instead, so
+        # anything wired to them stops cleanly rather than running on the wrong thing.
+        # ExecutionBlocker(message) still fires ComfyUI's own "execution_error" event
+        # (a visible red error toast, confirmed from execution.py's execution_block_cb)
+        # — ExecutionBlocker(None) blocks silently instead; this log line is the only
+        # visible trace, in the console, not a popup.
+        if seed_hunt:
+            log.info("[MuseMinimaxDirector] Seed Hunt is on — main images/audio outputs are blocked "
+                      "(not a picked result). Use candidate_1..4 instead.")
+            main_images = ExecutionBlocker(None)
+            main_audio = ExecutionBlocker(None)
+        else:
+            main_images, main_audio = images, audio
+
+        return (
+            main_images, main_audio, compiled_prompt_text, ref_images_used,
+            candidate_images[0], candidate_audio[0],
+            candidate_images[1] if candidate_images[1] is not None else empty_images,
+            candidate_audio[1] if candidate_audio[1] is not None else empty_audio,
+            candidate_images[2] if candidate_images[2] is not None else empty_images,
+            candidate_audio[2] if candidate_audio[2] is not None else empty_audio,
+            candidate_images[3] if candidate_images[3] is not None else empty_images,
+            candidate_audio[3] if candidate_audio[3] is not None else empty_audio,
+        )
 
 
 NODE_CLASS_MAPPINGS = {
