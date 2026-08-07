@@ -482,7 +482,7 @@
       ],
       "title": "Seed 3",
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-videohelpersuite",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "VHS_VideoCombine",
         "ue_properties": {
@@ -626,7 +626,7 @@
       ],
       "title": "Seed 4",
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-videohelpersuite",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "VHS_VideoCombine",
         "ue_properties": {
@@ -710,7 +710,7 @@
       ],
       "title": "Seed 1",
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-videohelpersuite",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "VHS_VideoCombine",
         "ue_properties": {
@@ -844,7 +844,7 @@
       ],
       "title": "Seed  2",
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-videohelpersuite",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "VHS_VideoCombine",
         "ue_properties": {
@@ -1004,7 +1004,7 @@
       ],
       "title": "Full",
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-videohelpersuite",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "VHS_VideoCombine",
         "ue_properties": {
@@ -1406,7 +1406,7 @@
       ],
       "title": "Full",
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-videohelpersuite",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "VHS_VideoCombine",
         "ue_properties": {
@@ -1474,7 +1474,7 @@
         }
       ],
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-itools",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "iToolsPreviewText",
         "ue_properties": {
@@ -1622,7 +1622,7 @@
         }
       ],
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-kjnodes",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "MiniMaxH3MemoryEfficientSageAttentionPatch",
         "ue_properties": {
@@ -1677,9 +1677,8 @@
           "input_ue_unconnectable": {},
           "version": "7.8"
         },
-        "cnr_id": "comfyui-workflow-encrypt",
-        "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
-        "Node name for S&R": "SolAttnPatch"
+        "Node name for S&R": "SolAttnPatch",
+        "aux_id": "kijai/ComfyUI-SolAttn_triton"
       },
       "widgets_values": [
         1.2,
@@ -1772,7 +1771,7 @@
         }
       ],
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-kjnodes",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "MiniMaxH3MemoryEfficientSageAttentionPatch",
         "ue_properties": {
@@ -1822,14 +1821,13 @@
         }
       ],
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
-        "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "SolAttnPatch",
         "ue_properties": {
           "widget_ue_connectable": {},
           "input_ue_unconnectable": {},
           "version": "7.8"
-        }
+        },
+        "aux_id": "kijai/ComfyUI-SolAttn_triton"
       },
       "widgets_values": [
         1.2,
@@ -1875,7 +1873,7 @@
         }
       ],
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-kjnodes",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "PathchSageAttentionKJ",
         "ue_properties": {
@@ -1963,7 +1961,7 @@
         }
       ],
       "properties": {
-        "cnr_id": "comfyui-workflow-encrypt",
+        "cnr_id": "comfyui-spectrum-minimax-h3",
         "ver": "5ec45fdac73d8bd6d732af76bbe81c94413b3e36",
         "Node name for S&R": "SpectrumApplyMiniMaxH3",
         "ue_properties": {
