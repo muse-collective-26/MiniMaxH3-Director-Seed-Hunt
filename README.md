@@ -12,6 +12,16 @@ This is a fork of [Muse Minimax Director](https://github.com/muse-collective-26/
 
 ---
 
+## Changelog
+
+### v1.1.0
+- **Fixed a crash on old saved workflows.** If you'd saved a workflow before this update and it failed to load with an error mentioning `Cannot create property 'characters'`, that's fixed — the node now resets its timeline gracefully instead of blocking the whole workflow from loading. If you hit this, the safest fix is to delete the Muse Minimax Director node from your old workflow and add a fresh one in its place, then re-enter your references/CUTs.
+- **Analyze button improvements:** it no longer leaks background/pose/setting details into character descriptions, and it now has its own settings (gear icon) so you can pick which vision provider/model it uses instead of being locked to a hidden default.
+- **Reference video:** added a "duplicate video, replace character" retention option for people who want to reuse a reference video's motion/scene but swap in a different character.
+- **Updated example workflow** (`workflows/muse_minimax_h3_director_scout_v1.json`) — now wired with **Patch Sol-Attn** as the active speed optimization. Based on direct same-seed testing, Sol-Attn was the only speed node that gave a real, consistent speed-up without any visible quality loss on hands/hair. The other speed nodes (Sage Attention variants, EasyCache, Spectrum) are left in the workflow but bypassed, so you can switch them on to compare for yourself — in our tests they either made no measurable difference or came with a quality cost.
+
+---
+
 ## Powered by MiniMax H3
 
 This node is a control layer built entirely on top of **MiniMax H3**, an open-weights omni-modal video generation model published by [MiniMax](https://www.minimax.io/). MiniMax H3 is the actual model doing every bit of the generation work here — this repository contains none of the model's weights, training code, or inference architecture. All of that lives in MiniMax H3 itself and in ComfyUI core's own stock support for it (`comfy_extras/nodes_minimax_h3.py`). What this node adds on top is a visual timeline/scripting layer, automatic chunking for videos longer than a single H3 generation, and correct handling of H3's reference-tag numbering — nothing more.
