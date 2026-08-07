@@ -1329,7 +1329,7 @@
         }
       ],
       "properties": {
-        "cnr_id": "muse-minimax-director",
+        "cnr_id": "muse-minimax-refine",
         "ver": "c9d01f903c60137e07bbf7412a748d79531bbbe2",
         "Node name for S&R": "MuseMinimaxRefine",
         "aux_id": "muse-collective-26/Muse-MiniMax-H3-Refine",
@@ -2186,7 +2186,7 @@
         }
       ],
       "properties": {
-        "cnr_id": "muse-minimax-director",
+        "cnr_id": "muse-minimax-director-seed-hunt",
         "ver": "c9d01f903c60137e07bbf7412a748d79531bbbe2",
         "Node name for S&R": "MuseMinimaxDirector",
         "ue_properties": {
@@ -2333,7 +2333,7 @@
         }
       ],
       "properties": {
-        "cnr_id": "muse-minimax-director",
+        "cnr_id": "muse-minimax-refine",
         "ver": "c9d01f903c60137e07bbf7412a748d79531bbbe2",
         "Node name for S&R": "MuseMinimaxRefine",
         "aux_id": "muse-collective-26/Muse-MiniMax-H3-Refine",
