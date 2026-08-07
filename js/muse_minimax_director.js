@@ -52,6 +52,21 @@ const AUDIO_RETENTION_OPTIONS = [
   { value: "partially_copy", label: "partially copy" },
   { value: "weak_reference", label: "weak reference" },
 ];
+// Same underlying H3 retention tokens as VISUAL_RETENTION_OPTIONS, but with one
+// extra entry aimed specifically at the "duplicate this video, replace the
+// character" editing workflow — weak_reference explicitly means "no visible
+// content is reused," which contradicts what Editing source role is supposed to
+// do (keep the same scene/action, swap only the person), so that combination was
+// a real, confirmed trap. This gives it its own clearly-labeled preset (mapping
+// to partially_preserved, the correct marker for "scene stays, person changes")
+// rather than expecting users to reverse-engineer the right abstract term.
+const VIDEO_RETENTION_OPTIONS = [
+  { value: "partially_preserved", label: "duplicate video, replace character (recommended for editing)" },
+  { value: "fully_preserved", label: "fully preserved" },
+  { value: "partially_preserved", label: "partially preserved" },
+  { value: "attribute_transfer", label: "attribute transfer" },
+  { value: "weak_reference", label: "weak reference (motion/camera only, scene not reused)" },
+];
 const VIDEO_ROLE_OPTIONS = [
   { value: "reference", label: "Reference (motion/style/camera)" },
   { value: "editing_source", label: "Editing source (replace something in it)" },
@@ -96,6 +111,17 @@ function injectStyles() {
     background: #ff4d4d22; color: #ff6b6b; border-radius: 4px; padding: 1px 6px;
     font-size: 9px; letter-spacing: 0.04em;
   }
+  .mmd-gear-btn {
+    background: none; border: none; color: #7a7a8c; cursor: pointer; font-size: 14px;
+    line-height: 1; padding: 2px 4px; border-radius: 4px; margin-left: auto;
+  }
+  .mmd-gear-btn:hover { color: #e4e4ea; background: #ffffff14; }
+  .mmd-gear-panel {
+    position: relative; background: #1a1a22; border: 1px solid #3a3a48; border-radius: 8px;
+    padding: 10px; margin: 4px 0 10px 0; display: flex; flex-direction: column; gap: 6px;
+  }
+  .mmd-gear-panel .mmd-box-row label { color: #9a9aae; font-size: 11px; }
+  .mmd-gear-hint { color: #6a6a7c; font-size: 10px; line-height: 1.4; }
 
   /* Boxed settings panel */
   .mmd-boxes-row { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -417,6 +443,23 @@ class MinimaxTimelineEditor {
     } catch (e) {
       parsed = {};
     }
+    // A workflow saved before this node gained a new required widget (resize_method,
+    // seed_hunt, etc.) has its widgets_values array positionally misaligned when
+    // loaded against the current INPUT_TYPES order — ComfyUI restores widget values
+    // by position, not by name, so timeline_data's slot can end up holding some
+    // other widget's saved value instead of real JSON (e.g. a bare number).
+    // JSON.parse("3") succeeds (it's valid JSON), so the try/catch above doesn't
+    // catch this — it silently produces a non-object, which used to crash hard a
+    // few lines below and abort loading the entire workflow (reported directly by
+    // a user: "Cannot create property 'characters' on number '3'"). Guard for it
+    // explicitly instead.
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      console.warn("[MuseMinimaxDirector] timeline_data wasn't a valid object (got:", parsed,
+        ") — this usually means an older saved workflow's widget values are misaligned with "
+        + "this node's current inputs. Resetting this node to a blank timeline; you'll need to "
+        + "re-enter its references/CUTs, but the rest of the workflow will load normally.");
+      parsed = {};
+    }
     if (!Array.isArray(parsed.characters)) parsed.characters = [];
     if (!Array.isArray(parsed.segments) || parsed.segments.length === 0) {
       parsed.segments = [{ prompt: "", weight: 1 }];
@@ -483,7 +526,7 @@ class MinimaxTimelineEditor {
     this.soundHint = document.createElement("div");
     this.soundHint.className = "mmd-track-hint";
     this.soundHint.style.marginTop = "-4px";
-    this.soundHint.textContent = "Ambience/physical sound across the whole clip, and any background score only the audience can hear — Reference mode only, kept separate the way MiniMax's own prompt format expects.";
+    this.soundHint.textContent = "Ambience/physical sound across the whole clip, and any background score only the audience can hear — kept separate the way MiniMax's own prompt format expects.";
     this.container.appendChild(this.soundHint);
 
     this.soundRow = document.createElement("div");
@@ -544,8 +587,23 @@ class MinimaxTimelineEditor {
     this.refsTitle = document.createElement("div");
     this.refsTitle.className = "mmd-section-title";
     this.refsTitle.style.marginTop = "4px";
-    this.refsTitle.textContent = "References";
+    const refsTitleText = document.createElement("span");
+    refsTitleText.textContent = "References";
+    this.refsTitle.appendChild(refsTitleText);
+    const analyzeGearBtn = document.createElement("button");
+    analyzeGearBtn.className = "mmd-gear-btn";
+    analyzeGearBtn.type = "button";
+    analyzeGearBtn.title = "Analyze button settings (provider, URL, model)";
+    analyzeGearBtn.textContent = "⚙";
+    analyzeGearBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.analyzeGearPanel.style.display = this.analyzeGearPanel.style.display === "none" ? "flex" : "none";
+    });
+    this.refsTitle.appendChild(analyzeGearBtn);
     this.container.appendChild(this.refsTitle);
+
+    this.analyzeGearPanel = this._buildAnalyzeSettingsPanel();
+    this.container.appendChild(this.analyzeGearPanel);
 
     this.refsBox = document.createElement("div");
     this.refsBox.className = "mmd-box mmd-box-reference";
@@ -664,14 +722,12 @@ class MinimaxTimelineEditor {
   }
 
   _toggleReferenceBox() {
-    const show = this.isReferenceMode() ? "" : "none";
     if (this.refBox) this.refBox.style.display = this.isReferenceMode() ? "block" : "none";
-    // Soundscape/Music are only meaningful in Reference mode — H3's First/Last
-    // Frame checkpoint never encodes reference audio at all, so there's no
-    // overall_soundscape/non_diegetic_music section to fill for that mode.
-    if (this.soundTitle) this.soundTitle.style.display = show;
-    if (this.soundHint) this.soundHint.style.display = show;
-    if (this.soundRow) this.soundRow.style.display = show === "" ? "flex" : "none";
+    // Soundscape/Music used to be Reference-mode-only (H3's First/Last Frame
+    // checkpoint never encodes reference audio), but the base-mode prompt format
+    // (T2VA/I2VA/FL2VA/L2VA) has its own overall_soundscape/non_diegetic_music
+    // sections too, per MiniMax's own guide — so this box now stays visible in
+    // both modes.
   }
 
   _selectRow(labelText, widget, onChange) {
@@ -1359,8 +1415,17 @@ class MinimaxTimelineEditor {
         "Role", entry.role || "reference", VIDEO_ROLE_OPTIONS,
         (v) => { entry.role = v; },
       ));
+      // Default keys off role, not just description: a blank description on plain
+      // "Reference" role genuinely means weak_reference (pure motion/camera, no
+      // scene) — but the same blank description on "Editing source" means the
+      // opposite, since editing is supposed to keep the scene and only swap the
+      // person. Defaulting both to weak_reference was the exact trap that caused
+      // a real, confirmed bad render.
+      const videoRetentionDefault = entry.retention || (
+        entry.description ? "fully_preserved" : (entry.role === "editing_source" ? "partially_preserved" : "weak_reference")
+      );
       wrap.appendChild(this._miniSelectRow(
-        "Retention", entry.retention || (entry.description ? "fully_preserved" : "weak_reference"), VISUAL_RETENTION_OPTIONS,
+        "Retention", videoRetentionDefault, VIDEO_RETENTION_OPTIONS,
         (v) => { entry.retention = v; },
       ));
     }
@@ -1515,6 +1580,85 @@ class MinimaxTimelineEditor {
     return await urlToB64(src);
   }
 
+  _buildAnalyzeSettingsPanel() {
+    const panel = document.createElement("div");
+    panel.className = "mmd-gear-panel";
+    panel.style.display = "none";
+    panel.addEventListener("click", (e) => e.stopPropagation());
+
+    const providerOptions = [
+      { value: "ollama", label: "Ollama (local)" },
+      { value: "lmstudio", label: "LM Studio (local)" },
+      { value: "gemini", label: "Gemini / Google" },
+      { value: "custom", label: "Custom (OpenAI-compatible)" },
+      { value: "off", label: "Off / Manual only" },
+    ];
+
+    const providerRow = document.createElement("div");
+    providerRow.className = "mmd-box-row";
+    const providerLabel = document.createElement("label");
+    providerLabel.textContent = "Provider";
+    providerRow.appendChild(providerLabel);
+    const providerSelect = document.createElement("select");
+    providerSelect.className = "mmd-box-select";
+    for (const opt of providerOptions) {
+      const o = document.createElement("option");
+      o.value = opt.value;
+      o.textContent = opt.label;
+      providerSelect.appendChild(o);
+    }
+    providerSelect.value = this.timeline.analyze_provider || "ollama";
+    providerSelect.addEventListener("change", () => {
+      this.timeline.analyze_provider = providerSelect.value;
+      this.commitChanges();
+    });
+    providerRow.appendChild(providerSelect);
+    panel.appendChild(providerRow);
+
+    const urlRow = document.createElement("div");
+    urlRow.className = "mmd-box-row";
+    const urlLabel = document.createElement("label");
+    urlLabel.textContent = "Base URL";
+    urlRow.appendChild(urlLabel);
+    const urlInput = document.createElement("input");
+    urlInput.type = "text";
+    urlInput.className = "mmd-box-number";
+    urlInput.style.width = "100%";
+    urlInput.placeholder = "blank = provider default";
+    urlInput.value = this.timeline.analyze_base_url || "";
+    urlInput.addEventListener("change", () => {
+      this.timeline.analyze_base_url = urlInput.value.trim();
+      this.commitChanges();
+    });
+    urlRow.appendChild(urlInput);
+    panel.appendChild(urlRow);
+
+    const modelRow = document.createElement("div");
+    modelRow.className = "mmd-box-row";
+    const modelLabel = document.createElement("label");
+    modelLabel.textContent = "Model";
+    modelRow.appendChild(modelLabel);
+    const modelInput = document.createElement("input");
+    modelInput.type = "text";
+    modelInput.className = "mmd-box-number";
+    modelInput.style.width = "100%";
+    modelInput.placeholder = "blank = provider default";
+    modelInput.value = this.timeline.analyze_model || "";
+    modelInput.addEventListener("change", () => {
+      this.timeline.analyze_model = modelInput.value.trim();
+      this.commitChanges();
+    });
+    modelRow.appendChild(modelInput);
+    panel.appendChild(modelRow);
+
+    const hint = document.createElement("div");
+    hint.className = "mmd-gear-hint";
+    hint.textContent = "Controls the Analyze button on every reference slot. Ollama/LM Studio run locally, no API key needed — but small local models follow detailed instructions less reliably than larger hosted ones. Gemini needs GEMINI_API_KEY set as an environment variable before starting ComfyUI. Custom expects an OpenAI-compatible /chat/completions endpoint.";
+    panel.appendChild(hint);
+
+    return panel;
+  }
+
   async runAnalysis(idx, isBg, btn, descInput) {
     if (btn.classList.contains("mmd-loading")) return;
     btn.classList.add("mmd-loading");
@@ -1529,7 +1673,9 @@ class MinimaxTimelineEditor {
         body: JSON.stringify({
           image_b64: [imageB64],
           char_index: isBg ? MAX_CHARACTER_SLOTS : idx,
-          provider: "ollama",
+          provider: this.timeline.analyze_provider || "ollama",
+          base_url: this.timeline.analyze_base_url || "",
+          model: this.timeline.analyze_model || "",
         }),
       });
       const result = await resp.json();

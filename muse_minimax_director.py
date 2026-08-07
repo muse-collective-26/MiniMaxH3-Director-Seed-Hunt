@@ -99,15 +99,32 @@ _MUSE_MINIMAX_PROVIDER_DEFAULTS = {
 
 _MUSE_MINIMAX_ANALYZE_PROMPT = (
     "Look at the image and write exactly one sentence describing it, in the form: a short "
-    "identity noun phrase, then a comma, then a detail clause of distinguishing features. "
+    "identity noun phrase, then a comma, then a detail clause of distinguishing features.\n\n"
+    "If the image shows the same subject repeated across a grid or multiple panels — a "
+    "character turnaround/reference sheet with several poses, angles, or close-ups of one "
+    "person — describe that ONE subject as a single coherent person, based on what's "
+    "consistent across every panel.\n\n"
+    "Describe only the subject itself — never the background, backdrop, studio setting, "
+    "location, or how they are posed or positioned in the photo. This applies to every image, "
+    "not just grids: a plain white backdrop, a bedroom, a street, a specific pose or camera "
+    "angle are all part of how this particular reference photo happens to be taken, not part of "
+    "the subject's own appearance, and must never appear in the description — regardless of "
+    "whether the subject is clothed or nude.\n\n"
     "If the main subject is a person/character, the identity phrase should be something like "
-    "'the young woman' or 'the man with the beard', and the detail clause should cover hair, "
-    "face, build, and clothing. If the main subject is a place/setting, the identity phrase "
-    "should be something like 'the coffee-shop environment' or 'the rooftop at night', and the "
-    "detail clause should cover the distinctive fixtures, colors, and lighting. If it's an "
-    "object, the identity phrase should name it, and the detail clause should cover its shape, "
-    "color, material, and distinctive details. Do not start with 'a photo of' or similar. Do "
-    "not state which category you chose. Output only the single sentence, nothing else."
+    "'the young woman' or 'the man with the beard', and the detail clause should cover, "
+    "concisely: hair (color, length, style), skin tone if distinctive, build, and — if clothed "
+    "— everything they're wearing from head to toe: top, bottom, footwear, and any accessories "
+    "such as jewelry, hats, bags, or glasses. If the subject is nude, say so plainly as part of "
+    "the detail clause instead of describing clothing. Only include what's actually visible; "
+    "skip any category that isn't shown (e.g. no visible footwear) rather than guessing or "
+    "inventing one. If the main subject IS a place or setting — the image itself is a "
+    "background/location reference, not a person or object photographed in front of one — the "
+    "identity phrase should be something like 'the coffee-shop environment' or 'the rooftop at "
+    "night', and the detail clause should cover the distinctive fixtures, colors, and lighting. "
+    "If it's an object, the identity phrase should name it, and the detail clause should cover "
+    "its shape, color, material, and distinctive details. Do not start with 'a photo of' or "
+    "similar. Do not state which category you chose. Output only the single sentence, nothing "
+    "else."
 )
 
 
@@ -1339,8 +1356,20 @@ class MuseMinimaxDirector:
                         chunk_first is not None, chunk_last is not None, base_last_shot, chunk_len_seconds)
                     if keyframe_line:
                         keyframe_line += base_continuity_extra
+                    # Pull the user's own Overall Soundscape / Non-Diegetic Music fields
+                    # (now shown in the UI for this mode too, not just Reference) and
+                    # append the auto-generated hybrid "no reference audio" note as a
+                    # suffix when relevant — same pattern Reference mode uses for its
+                    # own carry_audio_tag continuity clause.
+                    base_soundscape_text = (tdata.get("overall_soundscape") or "").strip()
+                    if base_soundscape_note:
+                        base_soundscape_text = (
+                            f"{base_soundscape_text} {base_soundscape_note}" if base_soundscape_text
+                            else base_soundscape_note
+                        )
+                    base_music_text = (tdata.get("non_diegetic_music") or "").strip()
                     chunk_prompt = _assemble_base_mode_prompt(
-                        keyframe_line, style_line, base_shot_lines, base_soundscape_note, "")
+                        keyframe_line, style_line, base_shot_lines, base_soundscape_text, base_music_text)
                 compiled_prompts.append(f"--- Chunk {chunk_idx + 1}/{num_chunks} (~{chunk_len_seconds:.1f}s) ---\n{chunk_prompt}")
 
                 log.info("[MuseMinimaxDirector] chunk %d/%d, seed=%d, length=%d frames, video_carry=%s, audio_carry=%s, hybrid=%s",
