@@ -14,6 +14,12 @@ This is a fork of [Muse Minimax Director](https://github.com/muse-collective-26/
 
 ## Changelog
 
+### v1.2.0
+- **Seed Hunt is now three independent toggles instead of one all-or-nothing switch.** `candidate_2` / `candidate_3` / `candidate_4` each run their own extra pass (or don't) — pick exactly which ones you want to pay for instead of always paying for all 3. `candidate_1` still always runs for free, same as before. Turning all three off runs exactly like a normal single-generation workflow, same as `seed_hunt` off used to. The old `seed_hunt` widget still exists on already-saved workflows but no longer does anything — it's kept only so its saved widget position doesn't shift and corrupt older saved workflows' stored data, not because it's still functional. If your old workflow relied on it, tick the three new toggles instead.
+- **New node: `MuseModelRoute`**, bundled in this same repo — the reverse of a switch. Feed it one MODEL and a boolean, and it sends that model to exactly one of two outputs (`on_true` / `on_false`), leaving the other empty. Pairs with this node's `model`/`model_fl2va` inputs so a single boolean can pick which checkpoint (Reference or First/Last-Frame) is actually active, instead of maintaining two separate model chains permanently wired in. See [Switching between Reference and First/Last Frame checkpoints, in detail](#switching-between-reference-and-firstlast-frame-checkpoints-in-detail).
+- **`model` no longer forces a checkpoint load it doesn't need.** Previously, the sigma-shift step run on `model` happened unconditionally regardless of `mode` — meaning `model` had to always be a real, connected checkpoint even in First/Last Frame mode using `model_fl2va`. It's now skipped when `model` is empty, which is what makes the `MuseModelRoute` pattern above possible without crashing. Doesn't change anything if you wire `model` normally, as before.
+- **Updated example workflow** — now wired with `MuseModelRoute` and a single boolean switch for the Reference/First-Last-Frame model choice, and the three independent candidate toggles in place of the old single `seed_hunt` checkbox.
+
 ### v1.1.0
 - **Fixed a crash on old saved workflows.** If you'd saved a workflow before this update and it failed to load with an error mentioning `Cannot create property 'characters'`, that's fixed — the node now resets its timeline gracefully instead of blocking the whole workflow from loading. If you hit this, the safest fix is to delete the Muse Minimax Director node from your old workflow and add a fresh one in its place, then re-enter your references/CUTs.
 - **Analyze button improvements:** it no longer leaks background/pose/setting details into character descriptions, and it now has its own settings (gear icon) so you can pick which vision provider/model it uses instead of being locked to a hidden default.
@@ -54,7 +60,7 @@ MiniMax H3 is a strong omni-modal model, but its native inputs are low-level: nu
 - **Correct `<Picture N>` / `<Video N>` / `<Audio N>` tag numbering** — built to match MiniMax H3's actual assignment rule, which is iteration order over the reference dictionary's values, **not** the numeric suffix of the input slot's own key. Reference items always land in the compiled prompt with the same tag numbers H3 itself will actually assign them
 - **MiniMax's full six-section reference-mode prompt format** — `subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`, `<Subject N>` abstraction layer, fixed-vocabulary retention markers, `[Shot N] At MM:SS.mmm` shot timestamps, and `(Sx)` speaker tags — built automatically from the timeline UI, per MiniMax's own official prompt-writing guide
 - **Multi-speaker CUTs** — pick one or more speaking characters per CUT via chips in the timeline UI; quoted dialogue gets auto-attributed and `(Sx)`-tagged against the right `<Subject N>`, with positional Ref Audio ↔ Ref character voice pairing
-- **Seed Hunt** — an optional toggle that runs the whole timeline 4 times at identical settings, seed only, and outputs all 4 as separate candidate image/audio pairs (see [Seed Hunt, in detail](#seed-hunt-in-detail) below)
+- **Seed Hunt** — three independent toggles (`candidate_2`/`candidate_3`/`candidate_4`), each running one extra full pass at identical settings, seed only, and filling its own candidate image/audio pair — pick exactly how many you want to pay for (see [Seed Hunt, in detail](#seed-hunt-in-detail) below)
 - **`ref_images_used` output** — the exact reference photos used for `<Picture N>` tagging on this run, ready to wire into [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine)'s own `ref_images` input for identity-locked second-pass refining
 - **Sigma shift controls** exposed directly on the node, applied via the real `MiniMaxH3SigmaShift` node
 - **Image + audio output**, not a bundled video file — wire straight into a standard Video Combine node alongside the rest of your pipeline
@@ -66,7 +72,8 @@ MiniMax H3 is a strong omni-modal model, but its native inputs are low-level: nu
 
 | Node | Description |
 |------|-------------|
-| `MuseMinimaxDirector` | Timeline-based director for MiniMax H3 — the only node in this package |
+| `MuseMinimaxDirector` | Timeline-based director for MiniMax H3 |
+| `MuseModelRoute` | Reverse of a switch — routes one MODEL to exactly one of two outputs based on a boolean, leaving the other empty. See [Switching between Reference and First/Last Frame checkpoints, in detail](#switching-between-reference-and-firstlast-frame-checkpoints-in-detail) |
 
 ---
 
@@ -131,7 +138,7 @@ You will also need a matching CLIP text encoder, a video VAE, and an audio VAE �
 
 ## Example workflow
 
-A ready-to-load workflow is included at [`workflows/muse_minimax_h3_director_scout_v1.json`](workflows/muse_minimax_h3_director_scout_v1.json) — the full Seed Hunt scouting pipeline: model loaders wired up, sigma-shift patches applied, `MuseMinimaxDirector` with `seed_hunt` on, all 4 candidates previewed through their own Video Combine nodes, and two [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine) nodes wired up (one candidate-driven, one taking the plain `images`/`audio` output for a single non-scouted run) feeding a final high-resolution output. Reference slots are left empty on purpose so you drop in your own characters and location rather than inheriting someone else's.
+A ready-to-load workflow is included at [`workflows/muse_minimax_h3_director_scout_v1.json`](workflows/muse_minimax_h3_director_scout_v1.json) — the full Seed Hunt scouting pipeline: model loaders wired up through a `MuseModelRoute` node and a boolean switch (see [Switching between Reference and First/Last Frame checkpoints, in detail](#switching-between-reference-and-firstlast-frame-checkpoints-in-detail)) so one toggle picks Reference vs. First/Last-Frame, sigma-shift patches applied, `MuseMinimaxDirector` with the `candidate_2`/`candidate_3`/`candidate_4` toggles on, all candidates previewed through their own Video Combine nodes, and two [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine) nodes wired up (one candidate-driven, one taking the plain `images`/`audio` output for a single non-scouted run) feeding a final high-resolution output. Reference slots are left empty on purpose so you drop in your own characters and location rather than inheriting someone else's.
 
 It also uses a few extra nodes purely for convenience/performance, on top of what's required above — search ComfyUI Manager for these if they show as missing when you load it:
 
@@ -167,8 +174,11 @@ None of these are needed for `MuseMinimaxDirector` itself to work — only for t
 | `chunk_duration_seconds` | FLOAT | Target length per chunk when chunking is needed |
 | `ref_image_size` | Combo | Resolution reference images are resized to before being sent to H3 |
 | `hybrid_continuation` | BOOLEAN | Reference mode only. When on (and `model_fl2va` is connected), chunk boundaries are hard-locked via the First/Last Frame checkpoint instead of soft carry-over conditioning |
-| `seed` | INT | Sampler seed for the main run (also the base seed for Seed Hunt's 4 candidates) |
-| `seed_hunt` | BOOLEAN | When on, runs the whole timeline 4 times — identical settings, only the seed differs — and fills `candidate_1..4_images/audio`. Takes ~4x as long as a single run; see [Seed Hunt, in detail](#seed-hunt-in-detail) |
+| `seed` | INT | Sampler seed for the main run (also the base seed for Seed Hunt's candidates) |
+| `seed_hunt` | BOOLEAN | Legacy, hidden from the node's UI. No longer has any effect — kept only so its saved widget position doesn't shift and corrupt older saved workflows' data. Use `candidate_2`/`candidate_3`/`candidate_4` instead |
+| `candidate_2` | BOOLEAN | Runs one extra full pass at `seed + 1,000,003` and fills `candidate_2_images`/`candidate_2_audio`. Independent of `candidate_3`/`candidate_4` — turn on only the ones you want to pay for |
+| `candidate_3` | BOOLEAN | Runs one extra full pass at `seed + 2,000,006` and fills `candidate_3_images`/`candidate_3_audio`. Independent of `candidate_2`/`candidate_4` |
+| `candidate_4` | BOOLEAN | Runs one extra full pass at `seed + 3,000,009` and fills `candidate_4_images`/`candidate_4_audio`. Independent of `candidate_2`/`candidate_3` |
 | `steps` | INT | Sampler steps |
 | `sampler_name` | Combo | Sampler algorithm |
 | `scheduler` | Combo | Noise scheduler |
@@ -180,14 +190,14 @@ None of these are needed for `MuseMinimaxDirector` itself to work — only for t
 
 | Output | Type | Description |
 |--------|------|--------------|
-| `images` | IMAGE | Generated video frames for the main run. **Blocked (not populated) when `seed_hunt` is on** — Seed Hunt is a scouting run, not a final one, so this only ever means "the one real generation" with Seed Hunt off. Use `candidate_1..4` instead when scouting |
+| `images` | IMAGE | Generated video frames for the main run. **Blocked (not populated) whenever any of `candidate_2`/`candidate_3`/`candidate_4` are on** — scouting extra candidates means this isn't a picked final result, so this only ever means "the one real generation" when none of them are on. Use `candidate_1..4` instead when scouting |
 | `audio` | AUDIO | Generated/mixed audio track, same blocking behavior as `images` |
-| `compiled_prompt` | STRING | The exact per-chunk prompt(s) actually sent to H3, including every resolved section, tag, and continuity language. The single best debugging tool for this node — if a render doesn't look right, check this first. Populated regardless of `seed_hunt` |
-| `ref_images_used` | IMAGE | The static `<Picture N>` reference image set actually used on this run's first chunk (character/product photos + background, in H3's own tag order). Reference mode only — empty in First/Last Frame mode. Wire into [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine)'s `ref_images` input for identity-locked refining. Populated regardless of `seed_hunt` |
-| `candidate_1_images` / `candidate_1_audio` | IMAGE / AUDIO | Always mirrors `images`/`audio` (the main run), at zero extra cost — populated whether or not `seed_hunt` is on |
-| `candidate_2..4_images` / `candidate_2..4_audio` | IMAGE / AUDIO | The 3 additional scouting passes (seed + N×1,000,003). Only populated when `seed_hunt` is on — empty otherwise |
+| `compiled_prompt` | STRING | The exact per-chunk prompt(s) actually sent to H3, including every resolved section, tag, and continuity language. The single best debugging tool for this node — if a render doesn't look right, check this first. Always populated |
+| `ref_images_used` | IMAGE | The static `<Picture N>` reference image set actually used on this run's first chunk (character/product photos + background, in H3's own tag order). Reference mode only — empty in First/Last Frame mode. Wire into [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine)'s `ref_images` input for identity-locked refining. Always populated (Reference mode) |
+| `candidate_1_images` / `candidate_1_audio` | IMAGE / AUDIO | Always mirrors `images`/`audio` (the main run), at zero extra cost — populated regardless of the candidate toggles |
+| `candidate_2..4_images` / `candidate_2..4_audio` | IMAGE / AUDIO | Each candidate's own extra scouting pass (seed + N×1,000,003) — only populated when that specific candidate's toggle is on, independent of the others |
 
-`images`/`audio` being blocked with `seed_hunt` on, and `candidate_2..4` being empty with it off, both use ComfyUI's `ExecutionBlocker` — anything wired to an unpopulated output stops silently (a console warning, no red error, no interruption to the rest of the queue) rather than running on the wrong data.
+`images`/`audio` being blocked when a candidate toggle is on, and an unused `candidate_N` output being empty when its toggle is off, both use ComfyUI's `ExecutionBlocker` — anything wired to an unpopulated output stops silently (a console warning, no red error, no interruption to the rest of the queue) rather than running on the wrong data.
 
 ---
 
@@ -310,6 +320,16 @@ The first chunk of a render is always generated in full Reference mode regardles
 
 ---
 
+## Switching between Reference and First/Last Frame checkpoints, in detail
+
+`model` and `model_fl2va` are normally two separate, permanently-wired inputs. If you'd rather flip between Reference mode and First/Last Frame mode with one boolean instead of maintaining two full LoRA/attention-patch chains side by side, the companion `MuseModelRoute` node (bundled in this same repo) lets a single switch pick which checkpoint is actually active.
+
+Wire your one shared LoRA/attention-patch chain's output into `MuseModelRoute`'s `model` input, then wire its two outputs so one feeds `model` and the other feeds `model_fl2va`. In the bundled example workflow, `false` routes the Reference (ref2va) checkpoint to `model`, and `true` routes the First/Last-Frame (fl2va) checkpoint to `model_fl2va`. Only one of the two Director sockets actually receives a real model on any given run — the other stays empty, which is safe because `model_fl2va` has always tolerated being empty, and `model` now does too, whenever it isn't the one currently needed.
+
+**Important**: `MuseModelRoute`'s boolean and the Director node's own `mode` dropdown are two separate controls with nothing keeping them in sync automatically. If you switch one without the other, the node will either sample with the wrong checkpoint for the mode you're in, or — if `model` ends up empty while `mode` is still set to Reference — fail outright. Always change both together.
+
+---
+
 ## Multi-speaker CUTs, in detail
 
 Each CUT can have one or more speaking characters selected via chips in the timeline UI. Quoted dialogue in a CUT's text gets `(Sx)` speaker tags auto-attached to the right `<Subject N>` occurrences, with `(Sx)` numbers assigned in order of first appearance within the chunk. Standalone reference audio clips pair positionally with character slots (Ref Audio N ↔ Ref N) for voice-timbre reference, cited against the correct `(Sx)` automatically. With exactly one speaker selected on a CUT, untagged dialogue is auto-attributed to them; with two or more selected, tag the `<Subject N>` you mean directly in the CUT text — there's no safe way to guess which speaker owns an untagged line once more than one is selected.
@@ -318,16 +338,18 @@ Each CUT can have one or more speaking characters selected via chips in the time
 
 ## Seed Hunt, in detail
 
-MiniMax H3 generation is expensive enough that finding out a render didn't follow the prompt, after paying full price for it, is a real cost. Seed Hunt runs the entire timeline **4 times** — identical prompt, identical settings, only the seed differs (`seed`, `seed + 1,000,003`, `seed + 2,000,006`, `seed + 3,000,009`) — and outputs all 4 as separate `candidate_1..4_images`/`candidate_1..4_audio` pairs, so you can generate cheaply (low `megapixels`), compare all 4, and only spend real compute refining the one that actually worked.
+MiniMax H3 generation is expensive enough that finding out a render didn't follow the prompt, after paying full price for it, is a real cost. Seed Hunt lets you generate several different seeds of the same prompt cheaply, compare them, and only spend real compute refining the one that actually worked.
 
-With `seed_hunt` off (the default), only `candidate_1` is populated (mirroring the main `images`/`audio` output, at no extra cost) and the main `images`/`audio` outputs work exactly as they do without this toggle at all.
+`candidate_1` always runs — it's the main `seed` run, at no extra cost, exactly as if this feature didn't exist. `candidate_2`, `candidate_3`, and `candidate_4` are three independent toggles; each one you switch on runs one extra full pass at `seed` plus a fixed offset (`+1,000,003` / `+2,000,006` / `+3,000,009`) and fills that candidate's own `candidate_N_images`/`candidate_N_audio` output. Turn on only as many as you actually want to pay for — one toggle costs one extra pass, not four.
 
-With `seed_hunt` on:
-- The main `images`/`audio` outputs are **intentionally blocked** — they don't mean "a picked result" during scouting, only during a normal single run, so nothing downstream can mistake an unpicked scout for a finished video.
-- All 4 `candidate_N` pairs are populated.
-- Expect roughly 4x the render time of a single run.
+With all three off (the default), the node behaves exactly like a plain single-generation run: `images`/`audio` are populated normally with the main result, and `candidate_1_images`/`candidate_1_audio` mirror it for free.
 
-**Recommended workflow**: set `megapixels` low for the Seed Hunt run (cheap, fast scouting), wire `candidate_1..4_images`/`audio` and `ref_images_used` into [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine), pick the candidate that actually matches the prompt via its button selector, and let Refine do the expensive, high-resolution second pass on just that one.
+With any of `candidate_2`/`candidate_3`/`candidate_4` on:
+- The main `images`/`audio` outputs are **intentionally blocked** — they don't mean "a picked result" while scouting, only during a normal single run, so nothing downstream can mistake an unpicked scout for a finished video.
+- Each candidate you turned on gets its own populated `candidate_N` pair; the ones you left off stay empty.
+- Render time scales with how many you turned on, not a fixed 4x.
+
+**Recommended workflow**: set `megapixels` low for scouting, turn on however many candidates you actually want to compare, wire `candidate_1..4_images`/`audio` and `ref_images_used` into [Muse Minimax Refine](https://github.com/muse-collective-26/Muse-MiniMax-H3-Refine), pick the candidate that actually matches the prompt via its button selector, and let Refine do the expensive, high-resolution second pass on just that one.
 
 ---
 
