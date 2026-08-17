@@ -990,10 +990,20 @@ class MuseMinimaxDirector:
         VAEDecodeAudio = NODE_CLASS_MAPPINGS["VAEDecodeAudio"]
 
         # Sigma shift only depends on the model + the two shift values — same for every
-        # chunk, so it only needs to run once rather than inside the loop.
-        shifted_model = _unpack_node_result(_execute_comfy_node(
-            MiniMaxH3SigmaShift, model=model, shift_video=shift_video, shift_audio=shift_audio,
-        ))[0]
+        # chunk, so it only needs to run once rather than inside the loop. Guarded the
+        # same way model_fl2va already is below — model is a required socket, but its
+        # actual VALUE can still be None at runtime (e.g. fed through an external
+        # router node that only populates whichever of model/model_fl2va matches the
+        # active mode) — First/Last Frame mode with model_fl2va connected never touches
+        # shifted_model at all, so there's nothing to gain by forcing this to run and
+        # crash on a None model in that case. Reference mode still needs a real model
+        # here; if that's None too, the crash just happens naturally further down at
+        # actual point of use (BasicGuider/BasicScheduler) instead of prematurely here.
+        shifted_model = None
+        if model is not None:
+            shifted_model = _unpack_node_result(_execute_comfy_node(
+                MiniMaxH3SigmaShift, model=model, shift_video=shift_video, shift_audio=shift_audio,
+            ))[0]
         # Computed once whenever model_fl2va is connected, not just for Hybrid
         # Continuation — First/Last Frame mode needs the exact same shifted fl2va
         # checkpoint for its own MiniMaxH3ImageToVideo calls, since that node
