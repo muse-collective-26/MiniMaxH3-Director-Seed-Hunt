@@ -1465,10 +1465,13 @@ class MuseMinimaxDirector:
         candidate_images = [images, None, None, None]
         candidate_audio = [audio, None, None, None]
 
-        # seed_hunt (legacy, hidden from the UI) forces all 3; candidate_2/3/4 are the
-        # independent per-candidate toggles that replace it going forward — each one
-        # only pays for its own extra pass, picked separately.
-        run_candidate = [False, seed_hunt or candidate_2, seed_hunt or candidate_3, seed_hunt or candidate_4]
+        # seed_hunt is legacy and hidden from the UI. It is intentionally NOT consulted
+        # here (even though it's still a real widget) because it has no visible control
+        # in this UI — if its stored value were ever left on (e.g. from an old saved
+        # workflow, or switching this node's code between versions on an already-placed
+        # node), it would silently force every candidate on with no way for the user to
+        # see or undo it. candidate_2/3/4 are the only things that decide this now.
+        run_candidate = [False, candidate_2, candidate_3, candidate_4]
         any_candidate = any(run_candidate[1:])
         if any_candidate:
             log.warning("[MuseMinimaxDirector] Running %d additional full pass(es) at identical "
