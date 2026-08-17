@@ -874,6 +874,26 @@ class MuseMinimaxDirector:
                 "shift_video": ("FLOAT", {"default": 12.0, "min": 0.01, "max": 100.0, "step": 0.01, "advanced": True}),
                 "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01, "advanced": True}),
                 "timeline_data": ("STRING", {"default": "{}", "multiline": False}),
+                # Appended after timeline_data (the last pre-existing required widget)
+                # deliberately — ComfyUI restores a saved workflow's widgets_values by
+                # position, not by name (see MinimaxTimelineEditor._loadState()'s own
+                # comment in the JS file), so any new required widget must go at the
+                # very end of this dict or every widget after it — especially
+                # timeline_data itself — silently misaligns on old saved workflows.
+                # Replaces the old all-or-nothing seed_hunt toggle with independent
+                # per-candidate control; seed_hunt itself stays put (untouched position,
+                # hidden from the UI) purely so old workflows that had it on keep
+                # running all 3 extra passes exactly as before.
+                "candidate_2": ("BOOLEAN", {"default": False, "tooltip":
+                    "Runs one extra full pass (identical settings, seed + 1,000,003) and fills the "
+                    "candidate_2 output. Independent of Candidate 3/4 — turn on only the ones you want "
+                    "to pay for."}),
+                "candidate_3": ("BOOLEAN", {"default": False, "tooltip":
+                    "Runs one extra full pass (identical settings, seed + 2,000,006) and fills the "
+                    "candidate_3 output. Independent of Candidate 2/4."}),
+                "candidate_4": ("BOOLEAN", {"default": False, "tooltip":
+                    "Runs one extra full pass (identical settings, seed + 3,000,009) and fills the "
+                    "candidate_4 output. Independent of Candidate 2/3."}),
             },
             "optional": {
                 "model_fl2va": ("MODEL", {"tooltip": "The separate First/Last-Frame checkpoint (not the same "
@@ -900,7 +920,7 @@ class MuseMinimaxDirector:
     def execute(self, mode, model, clip, vae, audio_vae, aspect_ratio, megapixels, multiple, resize_method,
                 duration_seconds, chunk_duration_seconds, ref_image_size, hybrid_continuation,
                 seed, seed_hunt, steps, sampler_name, scheduler, shift_video, shift_audio, timeline_data,
-                model_fl2va=None):
+                candidate_2=False, candidate_3=False, candidate_4=False, model_fl2va=None):
         tdata = _parse_timeline(timeline_data)
         # Resolved before any reference image is loaded — every character/background/
         # First-Last-Frame image gets fit to this exact resolution via resize_method,
@@ -1445,11 +1465,17 @@ class MuseMinimaxDirector:
         candidate_images = [images, None, None, None]
         candidate_audio = [audio, None, None, None]
 
-        if seed_hunt:
-            log.warning("[MuseMinimaxDirector] Seed Hunt is on — running 3 additional full passes "
-                        "(4 total) at identical settings, different seeds only. Takes ~4x as long as "
-                        "a single run.")
+        # seed_hunt (legacy, hidden from the UI) forces all 3; candidate_2/3/4 are the
+        # independent per-candidate toggles that replace it going forward — each one
+        # only pays for its own extra pass, picked separately.
+        run_candidate = [False, seed_hunt or candidate_2, seed_hunt or candidate_3, seed_hunt or candidate_4]
+        any_candidate = any(run_candidate[1:])
+        if any_candidate:
+            log.warning("[MuseMinimaxDirector] Running %d additional full pass(es) at identical "
+                        "settings, different seeds only.", sum(run_candidate[1:]))
             for i in range(1, 4):
+                if not run_candidate[i]:
+                    continue
                 pass_seed = seed + i * SEED_HUNT_SEED_STRIDE
                 c_images, c_audio, _ = _run_pass(pass_seed)
                 candidate_images[i] = c_images
@@ -1468,9 +1494,9 @@ class MuseMinimaxDirector:
         # (a visible red error toast, confirmed from execution.py's execution_block_cb)
         # — ExecutionBlocker(None) blocks silently instead; this log line is the only
         # visible trace, in the console, not a popup.
-        if seed_hunt:
-            log.info("[MuseMinimaxDirector] Seed Hunt is on — main images/audio outputs are blocked "
-                      "(not a picked result). Use candidate_1..4 instead.")
+        if any_candidate:
+            log.info("[MuseMinimaxDirector] One or more extra candidates ran — main images/audio "
+                      "outputs are blocked (not a picked result). Use candidate_1..4 instead.")
             main_images = ExecutionBlocker(None)
             main_audio = ExecutionBlocker(None)
         else:

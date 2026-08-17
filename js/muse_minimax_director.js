@@ -27,8 +27,12 @@ const BOXED_WIDGET_NAMES = [
   "mode", "duration_seconds", "chunk_duration_seconds",
   "aspect_ratio", "megapixels", "multiple", "resize_method",
   "steps", "sampler_name", "scheduler", "seed", "seed_hunt", "control_after_generate", "shift_video", "shift_audio",
-  "ref_image_size", "hybrid_continuation",
+  "ref_image_size", "hybrid_continuation", "candidate_2", "candidate_3", "candidate_4",
 ];
+// seed_hunt stays in this list (so it's still found, hidden, and serialized) but is
+// never given a row of its own below — it's legacy-only now, kept purely so an old
+// saved workflow that had it on keeps running all 3 extra passes. candidate_2/3/4
+// are the real, independently-toggleable replacement.
 // "seed" uses a text input below (see _seedRow), not the generic number row — avoids
 // <input type="number">'s tendency to mangle very large integers into scientific
 // notation on display/edit. It's still ultimately a plain JS Number under the hood,
@@ -136,6 +140,10 @@ function injectStyles() {
   .mmd-box-title {
     font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
     color: #6a6a7a; margin-bottom: 8px;
+  }
+  .mmd-box-subtitle {
+    font-size: 9px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+    color: #5a5a68; margin-top: 10px; padding-top: 8px; border-top: 1px solid #22222b;
   }
   .mmd-box-row {
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -690,9 +698,21 @@ class MinimaxTimelineEditor {
     if (this.realWidgets.steps) box.appendChild(this._numberRow("Steps", this.realWidgets.steps));
     if (this.realWidgets.seed) box.appendChild(this._seedRow(this.realWidgets.seed));
     if (this.realWidgets.control_after_generate) box.appendChild(this._selectRow("After Generate", this.realWidgets.control_after_generate));
-    if (this.realWidgets.seed_hunt) box.appendChild(this._boolRow("Seed Hunt (4 passes)", this.realWidgets.seed_hunt));
     if (this.realWidgets.shift_video) box.appendChild(this._numberRow("Shift (video)", this.realWidgets.shift_video));
     if (this.realWidgets.shift_audio) box.appendChild(this._numberRow("Shift (audio)", this.realWidgets.shift_audio));
+    if (this.realWidgets.candidate_2 || this.realWidgets.candidate_3 || this.realWidgets.candidate_4) {
+      const label = document.createElement("div");
+      label.className = "mmd-box-subtitle";
+      label.textContent = "Seed Hunt";
+      box.appendChild(label);
+      if (this.realWidgets.candidate_2) box.appendChild(this._boolRow("Candidate 2", this.realWidgets.candidate_2));
+      if (this.realWidgets.candidate_3) box.appendChild(this._boolRow("Candidate 3", this.realWidgets.candidate_3));
+      if (this.realWidgets.candidate_4) box.appendChild(this._boolRow("Candidate 4", this.realWidgets.candidate_4));
+      const hint = document.createElement("div");
+      hint.className = "mmd-track-hint";
+      hint.textContent = "Candidate 1 always runs for free. Each toggle here runs one extra full pass (same settings, different seed) and fills that candidate's own output — turn on only the ones you want to pay for.";
+      box.appendChild(hint);
+    }
 
     return box;
   }
