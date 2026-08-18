@@ -4251,7 +4251,7 @@
     },
     {
       "id": 213,
-      "type": "MuseMinimaxDirectorSeedHuntTest",
+      "type": "MuseMinimaxDirector",
       "pos": [
         70.84437433939047,
         4949.352159918999
@@ -4382,7 +4382,7 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "MuseMinimaxDirectorSeedHuntTest"
+        "Node name for S&R": "MuseMinimaxDirector"
       },
       "widgets_values": [
         "Reference (Omni) — up to 9 images, 3 videos, 3 audio",
